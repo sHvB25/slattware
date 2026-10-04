@@ -1,0 +1,141 @@
+#!/bin/sh
+# slattware-chroot — войти внутрь установленной системы.
+#
+# Аналог arch-chroot. Ничего не устанавливает и не настраивает: только
+# готовит корень к тому, чтобы ты делал всё руками внутри.
+#
+# Делает ровно четыре вещи, каждую видно:
+#   1. монтирует /proc, /sys, /dev, /dev/pts в корень
+#   2. копирует /etc/resolv.conf, иначе внутри нет сети
+#   3. запускает шелл от root
+#   4. на выходе отмонтирует всё, что смонтировал, в обратном порядке
+#
+# Ключевое отличие от mount --bind руками: размонтирование происходит
+# всегда. Забытый /dev или /proc внутри корня ломают следующий запуск
+# системы с этого раздела — выглядит как мистика, а причина банальная.
+
+set -e
+
+C_R=; C_G=; C_C=; C_RST=
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+    C_R=$(printf '\033[31m'); C_G=$(printf '\033[32m')
+    C_C=$(printf '\033[36m'); C_RST=$(printf '\033[0m')
+fi
+say() { printf '%s==>%s %s\n' "$C_C" "$C_RST" "$*"; }
+ok()  { printf '%s  ✓%s %s\n' "$C_G" "$C_RST" "$*"; }
+die() { printf '%schroot:%s %s\n' "$C_R" "$C_RST" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+slattware-chroot — войти внутрь установленной системы (аналог arch-chroot)
+
+  slattware-chroot <корень> [команда...]
+
+С опцией командой выполнит её и выйдет, без — запустит интерактивный
+шелл от root.
+
+Опции:
+  -u <пользователь>  войти от этого пользователя, а не от root
+  -n                  ничего не монтировать (корень уже готов)
+  -h                  эта справка
+
+Что монтируется и зачем:
+  /proc     — ps, top и /proc/self знают про себя
+  /sys      — сквозные характеристики: ядро видит, что за машина
+  /dev      — без него не работает почти ничего, включая tty
+  /dev/pts  — псевдотерминалы, без них редактор не запустится
+  resolv.conf копируется, чтобы внутри был резолв DNS
+EOF
+}
+
+USER_ARG=
+NOMOUNT=0
+
+while getopts 'u:nh' opt; do
+    case "$opt" in
+        u) USER_ARG=$OPTARG ;;
+        n) NOMOUNT=1 ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ $# -ge 1 ] || { usage >&2; exit 1; }
+TARGET=${1%/}
+shift
+
+case "$TARGET" in
+    /)  die "нельзя chroot'ить в /" ;;
+    /*) : ;;
+    *)  die "корень должен быть абсолютным: $TARGET" ;;
+esac
+[ -d "$TARGET" ] || die "нет такого каталога: $TARGET"
+[ -x "$TARGET/bin/sh" ] || die "в корне нет /bin/sh — это не корень системы"
+
+[ "$(id -u)" = 0 ] || die "нужны права root: sudo slattware-chroot ..."
+
+CMD=
+if [ $# -gt 0 ]; then
+    CMD="$*"
+fi
+
+# Что смонтировали: чтобы отмонтировать ровно это и ничего лишнего.
+# Порядок обратный — новые точки пишем В НАЧАЛО. Иначе снимешь /dev
+# раньше /dev/pts, и /dev останется висеть: точка вложена в неё.
+MOUNTED=
+
+mount_one() {
+    _d=$1
+    shift
+    mkdir -p "$TARGET$_d" 2>/dev/null || :
+    if mount "$@" "$TARGET$_d" 2>/dev/null; then
+        ok "$_d"
+        MOUNTED="$_d $MOUNTED"
+    else
+        printf '  ! %s не смонтировался (%s)\n' "$_d" "$*" >&2
+    fi
+}
+
+cleanup() {
+    [ -n "$MOUNTED" ] || return 0
+    say "размонтирую"
+    for d in $MOUNTED; do
+        if umount "$TARGET$d" 2>/dev/null; then
+            ok "снят $d"
+        else
+            printf '  ! %s остался смонтирован: им пользуется процесс\n' "$d" >&2
+        fi
+    done
+    return 0
+}
+
+if [ "$NOMOUNT" != 1 ]; then
+    say "монтирую"
+    mount_one /proc    -t proc    proc
+    mount_one /sys     -t sysfs   sysfs
+    mount_one /dev     --bind    /dev
+    mount_one /dev/pts --bind    /dev/pts
+    if [ -f /etc/resolv.conf ]; then
+        cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>/dev/null || :
+        ok "resolv.conf"
+    fi
+fi
+
+# Ловушка на любой выход: Ctrl-D, Ctrl-C, ошибка — размонтируем.
+trap cleanup EXIT INT TERM HUP
+
+if [ -n "$USER_ARG" ]; then
+    # su внутри chroot: - умышленно, чтобы окружение было чистым.
+    say "вхожу как $USER_ARG"
+    chroot "$TARGET" /usr/bin/env -i HOME=/home/"$USER_ARG" \
+        USER="$USER_ARG" /bin/sh -lc "$CMD"
+else
+    say "вхожу как root"
+    if [ -n "$CMD" ]; then
+        chroot "$TARGET" /bin/sh -c "$CMD"
+    else
+        printf '\n  %sвыход: exit или Ctrl-D%s\n\n' "$C_C" "$C_RST"
+        chroot "$TARGET" /bin/sh -l
+    fi
+fi
