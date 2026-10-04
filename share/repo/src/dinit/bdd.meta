@@ -1,0 +1,12 @@
+version: 1.0
+description: dinit — init и менеджер сервисов slattware
+maintainer: aetherria
+depends:
+# init системы. /init в корне — симлинк на /bin/dinit, его ставит initramfs
+# при switch_root. dinit читает /etc/dinit.conf и запускает сервисы из
+# /etc/dinit.d/.
+#
+# dinitctl нужен рядом: им останавливают и перезапускают сервисы, и им же
+# пользуются poweroff/reboot в /usr/local/bin.
+install:
+  bin  /bin

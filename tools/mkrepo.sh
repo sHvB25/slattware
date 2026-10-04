@@ -55,10 +55,6 @@ layout() {
 
     mkdir -p "$_data"
 
-    if [ -d "$_src/bin" ]; then
-        mkdir -p "$_data/usr/local/bin"
-        copy_tree "$_src/bin" "$_data/usr/local/bin"
-    fi
     # Каталоги, перекрытые install:, обычным циклом НЕ раскладываем:
     # иначе lib/ уедет и в /usr/local/lib/<имя>/, и по назначенному
     # абсолютному пути — в системе окажется две копии, и непонятно,
@@ -73,6 +69,24 @@ layout() {
             */*) SKIPED="$SKIPED ${_p%%/*}" ;;
         esac
     done
+
+    # bin/ разбирается отдельно от цикла (в /usr/local/bin), поэтому проверку
+    # пропуска надо делать и здесь. Раньше она стояла выше цикла и install:
+    # bin → /bin давал две копии: /bin/<имя> и /usr/local/bin/<имя>.
+    #
+    # Внимание, ровно как ниже: именно ${SKIPED}, а НЕ $_SKIPED. Подчёркивание
+    # — допустимый символ в имени переменной, поэтому $_SKIPED читает пустую
+    # _SKIPED, и проверка не срабатывает никогда.
+    case " ${SKIPED} " in
+        *" bin "*)
+            : ;;
+        *)
+            if [ -d "$_src/bin" ]; then
+                mkdir -p "$_data/usr/local/bin"
+                copy_tree "$_src/bin" "$_data/usr/local/bin"
+            fi
+            ;;
+    esac
 
     for sub in lib share doc; do
         [ -d "$_src/$sub" ] || continue

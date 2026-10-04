@@ -1,0 +1,21 @@
+version: 1.0
+description: busybox — userland: sh, ls, cat, grep, sed, tar и ещё 400 апплетов
+maintainer: aetherria
+depends:
+# Собран статически, поэтому musl ему не нужен. Из этого следует важное
+# свойство: поставить busybox можно в корень, где libc нет вовсе, и
+# получить рабочий шелл — то есть им чинится система, с которой уже
+# нечего запускать.
+#
+# 402 апплета — это симлинки на /bin/busybox. Раньше они создавались
+# вручную: build.sh делал `busybox --install -s /bin` внутри chroot,
+# и в rootfs/ их не было вообще. Из-за этого rootfs/ сам по себе не
+# описывал систему, а поставить userland через bdd было нечем.
+# Теперь симлинки часть пакета: bdd files покажет их все, и remove
+# снесёт все, а не один бинарь.
+#
+# Симлинки относительные (на "busybox"), поэтому пакет не сломается,
+# если корень переехала в /mnt/target через --root.
+build: ./bin/busybox --list | while read -r a; do [ "$a" = busybox ] && continue; ln -sfn busybox "bin/$a"; done
+install:
+  bin  /bin
