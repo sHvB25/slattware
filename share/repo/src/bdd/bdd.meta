@@ -1,0 +1,7 @@
+version: 0.3
+description: Пакетный менеджер slattware
+maintainer: aetherria
+depends:
+# Этот пакет — сам bdd. Служебный: ставится в образ диска заранее,
+# и bdd remove без --force его не тронет (см. essential в bdd).
+essential: yes

@@ -1,0 +1,8 @@
+# Монтирование виртуальных ФС по /etc/fstab.
+#
+# type = process, а не internal: internal в dinit означает «запустить самому,
+# без промежуточного процесса», и он рассчитан на встроенные команды dinit.
+# Для внешней программы нужен process или scripted.
+type = process
+command = /etc/mountall.sh
+restart = false

@@ -1,0 +1,9 @@
+NAME="Slattware"
+VERSION="0.2"
+ID=slattware
+PRETTY_NAME="Slattware 0.2"
+ANSI_COLOR="1;36"
+HOME_URL="https://github.com/aetherria/mydistro"
+SUPPORT_URL="https://github.com/aetherria/mydistro/issues"
+BUG_REPORT_URL="https://github.com/aetherria/mydistro/issues"
+LOGO=myfetch

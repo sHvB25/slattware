@@ -1,0 +1,20 @@
+version: 2.36
+description: GNU C Library — glibc рядом с musl, для запуска чужих бинарников
+maintainer: aetherria
+depends:
+# Готовые бинари Debian bookworm (libc6 2.36-9+deb12u14), распакованные
+# как есть. Ничего не компилируется: glibc нельзя собрать tcc, для этого
+# нужен полноценный gcc, а его собирать нечем.
+#
+# Раскладка по абсолютным путям (install:), а не через обычный lib/ →
+# /usr/local/lib/<имя>. Причина: обычная раскладка кладёт библиотеки в
+# /usr/local/lib/glibc/, а glibc-бинари ищут их в /lib/x86_64-linux-gnu/
+# и без явного --library-path не запускаются.
+#
+# /lib64/ld-linux-x86-64.so.2 — не украшение: именно этот путь стоит в
+# PT_INTERP у Debian/Ubuntu-бинарей. Без него `./программа` не стартует
+# вовсе ("not found"), хотя сама glibc рабочая. Ссылка относительная,
+# чтобы не сломаться при BDD_ROOT.
+install:
+  lib/x86_64-linux-gnu  /lib/x86_64-linux-gnu
+  lib64                 /lib64

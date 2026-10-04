@@ -1,0 +1,102 @@
+# /etc/profile — общая настройка окружения для slattware.
+# Читается login-шеллом (busybox ash) при входе.
+
+# --- пути ------------------------------------------------------------------
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# --- терминал --------------------------------------------------------------
+if [ -z "$TERM" ]; then
+    TERM=vt100
+fi
+export TERM
+[ -z "$HOME" ] && HOME=/root
+export HOME
+
+# --- часовой пояс -----------------------------------------------------------
+# В гостевой ФС нет базы zoneinfo, поэтому /etc/rc.local кладёт сюда
+# POSIX-строку от хоста (MSK-03:00). Дата в пакетах и в приглашении
+# будет в твоём времени, а не в UTC.
+if [ -z "$TZ" ] && [ -r /etc/tz ]; then
+    TZ=$(cat /etc/tz 2>/dev/null)
+    export TZ
+fi
+
+# --- ассоциативные массивы нет, поэтому алиасы раскрываем вручную ------------
+# Кеш команд, чтобы не искать заново
+alias ll='ls -lahF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ..='cd ..'
+alias ...='cd ../..'
+alias grep='grep -i'
+alias df='df -h'
+alias du='du -h'
+alias free='free -m'
+alias ps='ps aux'
+alias mkdir='mkdir -p'
+# rm намеренно НЕ переопределён: дефолтный rm в busybox безопаснее rm -rf.
+# Если очень хочется — есть alias rmf.
+alias rmf='rm -rf'
+alias cp='cp -i'
+alias mv='mv -i'
+alias h='history'
+alias c='clear'
+alias g='git'
+alias pkg='bdd'
+# Ставить и удалять пакеты нужно от root — файлы должны принадлежать
+# root, иначе setuid-бит не работает. Пароля нет, sudo спросит только
+# имя команды, поэтому alias с sudo — самый удобный вариант.
+alias inst='sudo bdd install'
+alias rm_pkg='sudo bdd remove'
+alias upg='sudo bdd upgrade'
+alias fetch='myfetch'
+alias doc='ls /usr/share/doc'
+alias pkgs='bdd list'
+alias installed='bdd list'
+alias reload='dinitctl reload'
+alias shutdown='poweroff'
+alias logs='dmesg | tail -n 30'
+
+# --- цвета -----------------------------------------------------------------
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+    export C_RST='\033[0m'  C_B='\033[1m'    C_DIM='\033[2m'
+    export C_R='\033[31m'   C_G='\033[32m'   C_Y='\033[33m'
+    export C_BLU='\033[34m' C_M='\033[35m'   C_C='\033[36m'
+    export C_W='\033[37m'
+fi
+
+# --- приглашение ------------------------------------------------------------
+_slattware_prompt() {
+    _u=$(id -un 2>/dev/null || echo '?')
+    _h=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo 'slattware')
+    _p='$'
+    [ "$_u" = root ] && _p='#'
+
+    if [ -n "$C_B" ] && [ -t 1 ]; then
+        # зелёный user@host, жёлтый путь, жирный символ
+        printf "${C_G}%s${C_RST}${C_DIM}@${C_RST}${C_C}%s${C_RST} ${C_Y}%s${C_RST}${C_B}%s${C_RST}\n" \
+            "$_u" "$_h" "${PWD:-/}" "$_p"
+    else
+        printf '%s@%s %s%s\n' "$_u" "$_h" "${PWD:-/}" "$_p"
+    fi
+}
+PS1='$(_slattware_prompt) '
+PS2='> '
+export PS1 PS2
+
+# --- история ---------------------------------------------------------------
+HISTFILE=/root/.ash_history
+HISTSIZE=200
+export HISTFILE HISTSIZE
+
+# --- приветствие ------------------------------------------------------------
+# motd здесь НЕ печатается: его показывает /etc/rc.local при загрузке,
+# один раз. Иначе он сыпался бы на каждый новый шелл.
+
+# Удобная функция: собрать и поставить свой пакет одной командой
+mkpkg() {
+    bdd create "$@"
+    echo "Готово. Поставить: sudo bdd install <имя>-<вер>.bddpkg"
+    echo "Или в общий репозиторий: cp <имя>-*.bddpkg /shared/repo/ && ./tools/mkrepo.sh"
+}

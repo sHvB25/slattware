@@ -1,0 +1,94 @@
+Шпаргалка slattware
+===================
+
+Файлы и каталоги
+----------------
+  ls -lahF dir/       список с размерами
+  cd ...             на два уровня выше
+  du -h /usr/local   сколько занимает
+  df -h               свободное место
+  cp -i / mv -i      с подтверждением
+  rmf                rm -rf (в алиасах rm НЕ переопределён — намеренно)
+  find / -name '*.c' поиск по имени файла
+
+Права
+-----
+  sudo <команда>     от root (через sud, белый список команд)
+  sudo -l            что вообще можно делать от root
+  id / whoami         кто я
+  sudo dinitctl list  состояние сервисов
+  sudo dinitctl stop <сервис>
+
+Сервисы dinit: etc, net, hostname, share, rc, boot
+
+Сеть
+----
+  ip addr             адреса (гость: 10.0.2.15, шлюз 10.0.2.2)
+  ping 10.0.2.2       шлюз
+  wget <url>          скачать
+  nslookup example.com
+
+Время
+-----
+  date                время хоста (часовой пояс приходит с хоста)
+  uptime              сколько работает
+  cat /proc/uptime    то же, но без лишнего
+
+Процессы
+--------
+  ps aux              все процессы
+  top                 (busybox top)
+  free -m             память
+
+Информация о системе
+--------------------
+  myfetch             логотип, uptime, память, диски, число пакетов
+  bdd --version       версия пакетного менеджера
+  cat /etc/os-release версия дистрибутива
+
+Хост и общая папка
+------------------
+  /shared             общая папка с хостом, запись работает
+  ls /shared/repo     локальный репозиторий пакетов
+
+Выключение и перезагрузка
+-------------------------
+  sudo poweroff       выключить
+  sudo reboot         перезагрузить
+
+Пакеты
+------
+  sudo bdd update          обновить индексы (нужен root)
+  sudo bdd install hello   поставить
+  sudo bdd remove hello    снести
+  bdd list                 что установлено
+  bdd search привет        поиск по репозиторию — sudo НЕ нужен
+  bdd info sud             подробности о пакете
+  bdd files sud            какие файлы он поставил
+  mkpkg mytool ~/Projects/mytool   собрать свой пакет + подсказка
+
+Компиляция
+----------
+  tcc -o prog prog.c
+  tcc -static -o prog prog.c        НЕ работает: tcc-static падает с segfault
+
+Свой пакет за минуту
+--------------------
+  mkdir -p ~/Projects/hello
+  cd ~/Projects/hello
+  cat > hello.c <<'EOF'
+  #include <stdio.h>
+  int main(void){puts("привет");return 0;}
+  EOF
+  cat > bdd.meta <<'EOF'
+  version: 0.1
+  description: Мой первый пакет
+  maintainer: slat
+  depends:
+  build: mkdir -p bin && tcc -o bin/hello hello.c
+  EOF
+  mkpkg hello .
+  sudo bdd install hello-0.1.bddpkg
+  hello
+
+Подробнее: /usr/share/doc/slattware/packaging

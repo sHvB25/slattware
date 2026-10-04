@@ -1,0 +1,7 @@
+version: 0.1
+description: Помощник для повышения прав (setuid, белый список команд)
+maintainer: aetherria
+depends:
+build: mkdir -p bin && $TCC -o bin/sud sud.c
+setuid: /usr/local/bin/sud
+essential: yes

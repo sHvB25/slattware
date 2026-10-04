@@ -1,0 +1,5 @@
+version: 0.1
+description: Тестовая программа hello из твоего дистрибутива
+maintainer: aetherria
+depends:
+build: mkdir -p bin && $TCC -o bin/hello hello.c

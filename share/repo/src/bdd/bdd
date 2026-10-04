@@ -1,0 +1,957 @@
+#!/bin/sh
+# bdd — пакетный менеджер slattware
+#
+# Формат пакета: .bddpkg — это gzip-архив tar с двумя записями:
+#     meta          — метаданные (ключ: значение, по строке)
+#     data/...      — раскладываемая файловая система
+#
+# Состояние:
+#     /etc/bdd/repos        список репозиториев, по одному URL на строку
+#     /var/lib/bdd/index/   скачанные индексы (по одному на репозиторий)
+#     /var/lib/bdd/db/      метаданные установленных пакетов
+#     /var/lib/bdd/files/   манифест файлов каждого пакета (для remove)
+#     /var/cache/bdd/       кэш скачанных .bddpkg
+
+BDD_VERSION=0.3
+
+# Отладочный след. BDD_X=1 включает `set -x` и уводит stderr в файл
+# $BDD_TRACE (по умолчанию — на общей шаре, чтобы след пережил гостя).
+# Нужен потому, что strace/ltrace в системе нет, а bdd — скрипт на
+# сотни команд: «зависло на mv или на чтении индекса» без следа
+# не отличить. Обычный запуск не затронут.
+if [ -n "${BDD_X:-}" ]; then
+    BDD_TRACE=${BDD_TRACE:-/shared/.vmsh/trace.txt}
+    exec 2>>"$BDD_TRACE"
+    set -x
+fi
+
+PREFIX=/usr/local
+BD_PREFIX=/var/lib/bdd
+DB=$BD_PREFIX/db
+FILES=$BD_PREFIX/files
+INDEX=$BD_PREFIX/index
+CACHE=/var/cache/bdd
+LOG=/var/log/bdd.log
+
+# Компилятор для строки build: в bdd.meta. На хосте его подставляет
+# tools/mkrepo.sh, в гостю берётся системный tcc.
+BDD_CC=${BDD_CC:-tcc}
+
+# Репозитории и лог можно переопределить через окружение (BDD_REPOS, BDD_LOG).
+REPOS=${BDD_REPOS:-/etc/bdd/repos}
+LOG=${BDD_LOG:-$LOG}
+
+# --- цвета -----------------------------------------------------------------
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+    C_RST=$(printf '\033[0m'); C_B=$(printf '\033[1m')
+    C_R=$(printf '\033[31m'); C_G=$(printf '\033[32m')
+    C_Y=$(printf '\033[33m'); C_C=$(printf '\033[36m')
+else
+    C_RST=; C_B=; C_R=; C_G=; C_Y=; C_C=
+fi
+
+die()  { printf '%sbdd: %s%s\n' "$C_R" "$*" "$C_RST" >&2; exit 1; }
+info() { printf '%s==>%s %s\n' "$C_C" "$C_RST" "$*"; }
+ok()   { printf '%s  ✓%s %s\n' "$C_G" "$C_RST" "$*"; }
+warn() { printf '%swarn:%s %s\n' "$C_Y" "$C_RST" "$*" >&2; }
+
+# Установка и удаление меняют файлы в /usr/local и /var, поэтому
+# требуют root. Без прав файлы остались бы твоими: setuid не работал бы,
+# а удалить их потом было бы нечем. Посмотреть (list/info/search) можно
+# всегда.
+need_root() {
+    [ "$(id -u)" = 0 ] && return 0
+    printf '%sbdd: %s требует прав root%s\n' "$C_R" "$1" "$C_RST" >&2
+    printf '  поставь так: sudo %s\n' "$2" >&2
+    exit 1
+}
+
+# Логирование в /var/log/bdd.log. Обычный пользователь туда писать не
+# может, и перенаправление >> само по себе ругается в терминал
+# («Permission denied»), поэтому сначала проверяем, что место есть и
+# доступно, иначе просто молчим: это не ошибка работы bdd.
+log() {
+    case "$LOG" in
+        ''|/dev/*|-) printf '%s %s\n' "$(date '+%F %T')" "$*"; return 0 ;;
+    esac
+    # Имя переменной с префиксом _ обязательно: у ash нет local, и
+    # обычное d затирало бы d вызывающей функции. do_install_tarball
+    # после log делает `rm -rf "$d"` и однажды снёс /var/log вместо
+    # своего временного каталога.
+    _ld=$(dirname "$LOG")
+    [ -d "$_ld" ] && [ -w "$_ld" ] || return 0
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" 2>/dev/null || :
+}
+
+# --- мелкие помощники -------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Пакетный путь. По умолчанию /usr/local — чтобы не мешать базовой системе.
+BDD_ROOT=${BDD_ROOT:-}
+ROOTARG=0
+[ -n "$BDD_ROOT" ] && ROOTARG=1
+
+# Префикс пути к корню, если задан BDD_ROOT.
+r() {
+    if [ "$ROOTARG" = 1 ]; then printf '%s%s' "$BDD_ROOT" "$1"
+    else printf '%s' "$1"; fi
+}
+
+# достать значение ключа из файла meta
+meta_get() {
+    # meta_get файл ключ
+    [ -f "$1" ] || return 1
+    sed -n "s/^$2:[[:space:]]*//p" "$1" | head -n1
+}
+
+repo_name() {
+    # уникальное короткое имя репозитория по URL
+    printf '%s' "$1" | sed 's|.*/||; s|[^a-zA-Z0-9._-]|_|g'
+}
+
+# Список репозиториев без комментариев и пустых строк.
+repo_list() {
+    [ -f "$REPOS" ] || return 0
+    sed 's/#.*//; s/[[:space:]]//g' "$REPOS" | grep -v '^$'
+}
+
+sanitize() {
+    # убрать из имени всё лишнее, чтобы не сломать пути
+    printf '%s' "$1" | sed 's|[^a-zA-Z0-9._+-]|_|g'
+}
+
+# Полный путь к индексу конкретного репозитория.
+idx_path() {
+    printf '%s/%s.idx' "$INDEX" "$(repo_name "$1")"
+}
+
+# Скачать url в файл. Поддерживаем file:// (для 9p-шары) и http(s)://.
+fetch() {
+    _url=$1; _out=$2
+    case "$_url" in
+        file://*) cp -f "${_url#file://}" "$_out" ;;
+        http://*|https://*)
+            have wget || die "нет wget, не умею качать $_url"
+            wget -q -O "$_out" "$_url" || return 1
+            ;;
+        /*) cp -f "$_url" "$_out" ;;   # локальный путь
+        *)  return 1 ;;
+    esac
+}
+
+# URL -> путь внутри репозитория (для file:// это просто путь).
+repo_join() {
+    printf '%s/%s' "${1%/}" "$2"
+}
+
+# Путь к bdd.db на шаре (только для file://-репозиториев).
+repo_index_file() {
+    case "$1" in
+        file://*) _s=${1%/}/bdd.db; printf '%s\n' "${_s#file://}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Содержимое индекса репозитория — откуда оно вообще доступно.
+#
+# Кэш живёт в /var/lib/bdd/index и писать его может только root. Но
+# читать индекс должны все: иначе на свежей системе `bdd search` от
+# обычного пользователя ответил бы «ничего не найдено», хотя на шаре
+# четыре пакета. Поэтому для file://-репозитория (а это наш основной
+# случай: общий каталог с хостом через 9p) читаем bdd.db прямо с шары,
+# если кэша нет или он старше файла на шаре.
+#
+# Печатает строки индекса, возвращает 0 если хоть что-то прочитано.
+index_lines() {
+    _r=$1
+    _idx=$(idx_path "$_r")
+    _src=$(repo_index_file "$_r") || _src=
+    if [ -n "$_src" ]; then
+        # файл:// — источник истины, свежесть сравниваем по mtime
+        if [ -f "$_idx" ] && [ ! "$_src" -nt "$_idx" ]; then
+            cat "$_idx"
+            return 0
+        fi
+        [ -f "$_src" ] || return 1
+        cat "$_src"
+        return 0
+    fi
+    [ -f "$_idx" ] || return 1
+    cat "$_idx"
+}
+
+# Есть ли индекс (кэш или прямая выдача) у репозитория.
+have_index() {
+    index_lines "$1" >/dev/null 2>&1
+}
+
+# Найти файл пакета по имени в индексах. Печатает: URL|версия|sha256|размер|repo
+lookup() {
+    _want=$(sanitize "$1")
+    for _r in $(repo_list); do
+        _line=$(index_lines "$_r" 2>/dev/null | awk -v n="$_want" -F'|' '
+            $1 == n { print; exit }')
+        [ -n "$_line" ] || continue
+        _file=$(printf '%s' "$_line" | cut -d'|' -f5)
+        _ver=$(printf '%s' "$_line" | cut -d'|' -f2)
+        _sha=$(printf '%s' "$_line" | cut -d'|' -f3)
+        _sz=$(printf '%s' "$_line" | cut -d'|' -f4)
+        printf '%s|%s|%s|%s|%s\n' \
+            "$(repo_join "$_r" "$_file")" "$_ver" "$_sha" "$_sz" "$_r"
+        return 0
+    done
+    return 1
+}
+
+installed() { [ -f "$DB/$1" ]; }
+
+# Рекурсивная проверка зависимостей. Печатает имена недостающих пакетов.
+missing_deps() {
+    _pkg=$1
+    _meta=$DB/$_pkg
+    [ -f "$_meta" ] || _meta=$2
+    [ -f "$_meta" ] || return 0
+    _deps=$(meta_get "$_meta" depends)
+    [ -n "$_deps" ] || return 0
+    for _d in $_deps; do
+        _d=${_d%%:*}
+        if ! installed "$_d"; then
+            printf '%s\n' "$_d"
+        else
+            missing_deps "$_d" ""
+        fi
+    done
+}
+
+# ------------------------------------------------------------------ команды
+
+cmd_help() {
+    cat <<EOF
+${C_B}bdd $BDD_VERSION${C_RST} — пакетный менеджер slattware
+
+${C_B}Использование:${C_RST}
+  bdd <команда> [аргументы]
+
+${C_B}Команды:${C_RST}
+  ${C_C}update${C_RST}                обновить индексы репозиториев
+  ${C_C}upgrade${C_RST} [пакет]      обновить всё или один пакет
+  ${C_C}install${C_RST} <пакет...>   поставить с зависимостями
+                              (принимает и путь к .bddpkg)
+  ${C_C}remove${C_RST} [--force] <пакет...>
+                              удалить пакет (--force — без вопросов)
+  ${C_C}list${C_RST}                  список установленных
+  ${C_C}search${C_RST} <строка>       поиск по индексам
+  ${C_C}info${C_RST} <пакет>          подробности о пакете
+  ${C_C}files${C_RST} <пакет>         какие файлы поставил пакет
+  ${C_C}deps${C_RST} <пакет>          дерево зависимостей
+  ${C_C}owns${C_RST} <файл>           какой пакет владеет файлом
+  ${C_C}create${C_RST} <имя> <папка>  собрать .bddpkg из папки
+  ${C_C}repos${C_RST}                 список репозиториев
+  ${C_C}clean${C_RST}                 почистить кэш
+  ${C_C}help${C_RST}                  эта справка
+
+${C_B}Примеры:${C_RST}
+  sudo bdd update
+  sudo bdd install hello
+  bdd search editor
+  bdd create mytool ~/Projects/mytool
+
+${C_B}Права:${C_RST}
+  Установка и удаление меняют систему, поэтому нужен root: sudo bdd ...
+  Смотреть можно как есть: bdd list, bdd search, bdd info, bdd files,
+  bdd owns, bdd deps, bdd repos, bdd create, bdd help.
+
+${C_B}Раскладка исходника пакета:${C_RST}
+  bdd.meta          метаданные; build: — команда сборки, setuid: — файл
+  bin/*             → /usr/local/bin/
+  lib/*             → /usr/local/lib/<имя>/
+  share/*           → /usr/local/share/<имя>/
+  doc/* и *.c *.h   → /usr/share/doc/<имя>/
+  прочее            → /usr/local/bin/ (если без расширения)
+EOF
+}
+
+cmd_repos() {
+    if [ ! -f "$REPOS" ]; then
+        printf 'репозиториев нет: %s\n' "$REPOS"
+        return 0
+    fi
+    n=0
+    for r in $(repo_list); do
+        n=$((n+1))
+        if ! have_index "$r"; then
+            printf '%s%2d%s  %s %s(индекса нет — sudo bdd update)%s\n' \
+                "$C_Y" "$n" "$C_RST" "$r" "$C_RST"
+            continue
+        fi
+        cnt=$(index_lines "$r" 2>/dev/null | wc -l)
+        src=$(repo_index_file "$r") || src=
+        if [ -n "$src" ] && [ -f "$(idx_path "$r")" ] && [ "$src" -nt "$(idx_path "$r")" ]; then
+            printf '%s%2d%s  %s %s(%s пакетов, кэш протух — читаю прямо с шары)%s\n' \
+                "$C_Y" "$n" "$C_RST" "$r" "$C_C" "$cnt" "$C_RST"
+        elif [ -f "$(idx_path "$r")" ]; then
+            printf '%s%2d%s  %s %s(%s пакетов, индекс есть)%s\n' \
+                "$C_G" "$n" "$C_RST" "$r" "$C_C" "$cnt" "$C_RST"
+        else
+            printf '%s%2d%s  %s %s(%s пакетов, читаю прямо с шары, кэша нет)%s\n' \
+                "$C_G" "$n" "$C_RST" "$r" "$C_C" "$cnt" "$C_RST"
+        fi
+    done
+}
+
+cmd_update() {
+    [ -f "$REPOS" ] || die "нет файла репозиториев: $REPOS"
+    # Индекс — системный кэш в /var/lib/bdd, писать его может только root.
+    # Без этой проверки пользователь получал «cp: Permission denied»
+    # вместо ответа, что делать.
+    if [ "$(id -u)" != 0 ]; then
+        die "обновление индекса пишет в $INDEX — нужен root
+  поставь так: sudo bdd update
+  (для просмотра этого необязательно: bdd search работает и без кэша)"
+    fi
+    found=0
+    for r in $(repo_list); do
+        found=1
+        info "обновляю индекс: $r"
+        mkdir -p "$INDEX" 2>/dev/null || :
+        if fetch "${r%/}/bdd.db" "$(idx_path "$r").new"; then
+            mv -f "$(idx_path "$r").new" "$(idx_path "$r")"
+            ok "$(wc -l < "$(idx_path "$r")" 2>/dev/null) пакетов в индексе"
+        else
+            rm -f "$(idx_path "$r").new"
+            warn "не удалось скачать индекс $r"
+        fi
+    done
+    [ "$found" = 1 ] || die "список репозиториев пуст"
+    log "update done"
+}
+
+cmd_list() {
+    if [ ! -d "$DB" ] || [ -z "$(ls -A "$DB" 2>/dev/null)" ]; then
+        printf 'установленных пакетов нет\n'
+        return 0
+    fi
+    printf '%s%-24s %-10s %s%s\n' "$C_B" "ПАКЕТ" "ВЕРСИЯ" "ОПИСАНИЕ" "$C_RST"
+    for m in "$DB"/*; do
+        [ -f "$m" ] || continue
+        p=$(basename "$m")
+        v=$(meta_get "$m" version); v=${v:-?}
+        d=$(meta_get "$m" description); d=${d:--}
+        printf '%-24s %-10s %s\n' "$p" "$v" "$d"
+    done
+}
+
+# Скачать индексы, если их ещё нет или если устарели.
+#
+# Для file:// (локальный репозиторий, общий с хостом через 9p) индекс —
+# обычный файл, у которого есть время изменения. Если bdd.db на шаре
+# свежее скачанного, значит пакеты пересобрали, и старый индекс больше
+# не годится: без этой проверки установка падала бы с «sha256 не совпал».
+ensure_index() {
+    mkdir -p "$INDEX" 2>/dev/null || return 1
+    [ -w "$INDEX" ] || return 1
+
+    need=0
+    for r in $(repo_list); do
+        idx=$(idx_path "$r")
+        src=$(repo_index_file "$r") || src=
+        if [ ! -f "$idx" ]; then
+            need=1; break
+        fi
+        # -nt доступен в ash; если файлов нет, -nt ложно
+        if [ -n "$src" ] && [ "$src" -nt "$idx" ]; then
+            need=1; break
+        fi
+    done
+    [ "$need" = 1 ] || return 0
+
+    printf '%sиндекс репозитория обновляю%s\n' "$C_Y" "$C_RST"
+    cmd_update || return 1
+}
+
+cmd_search() {
+    [ $# -ge 1 ] || die "usage: bdd search <строка>"
+    # Кэш обновляем, только если это вообще возможно (нужен root);
+    # index_lines сам доберёт индекс с file://-шары, если кэша нет.
+    ensure_index >/dev/null 2>&1 || :
+    q=$*
+    found=0
+    tmpf=$(mktemp) || tmpf=
+    for r in $(repo_list); do
+        index_lines "$r" 2>/dev/null > "$tmpf" || continue
+        while IFS='|' read -r n v sha sz file desc; do
+            case "$n $desc" in
+                *"$q"*) printf '%s/%-20s %s%s%s  %s\n' \
+                            "$C_C" "$n" "$C_Y" "$v" "$C_RST" "$desc"
+                       found=1 ;;
+            esac
+        done < "$tmpf"
+    done
+    [ -n "$tmpf" ] && rm -f "$tmpf"
+    [ "$found" = 1 ] || printf 'ничего не найдено: %s\n' "$q"
+}
+
+cmd_info() {
+    [ $# -eq 1 ] || die "usage: bdd info <пакет>"
+    p=$(sanitize "$1")
+    if installed "$p"; then
+        printf '%s%s%s (установлен)\n' "$C_G" "$p" "$C_RST"
+        src="$DB/$p"
+    else
+        # ensure_index сам решит, можно ли: пользователю кэш недоступен,
+        # но для file://-репозитория индекс и так читается с шары.
+        ensure_index >/dev/null 2>&1 || :
+        line=$(lookup "$p") || die "пакет не найден: $1 (sudo bdd update)"
+        tmpd=$(mktemp -d) || die "нет mktemp"
+        fetch "${line%%|*}" "$tmpd/pkg" || { rm -rf "$tmpd"; die "не скачать $p"; }
+        tar -xzf "$tmpd/pkg" -C "$tmpd" meta 2>/dev/null \
+            || { rm -rf "$tmpd"; die "битый пакет: $p"; }
+        src="$tmpd/meta"
+        printf '%s%s%s (доступен в репозитории)\n' "$C_Y" "$p" "$C_RST"
+    fi
+    while IFS= read -r line; do
+        printf '  %s\n' "$line"
+    done < "$src"
+    case "$src" in
+        /var/lib/bdd/*) : ;;
+        *) rm -rf "$(dirname "$src")" ;;
+    esac
+}
+
+cmd_files() {
+    [ $# -eq 1 ] || die "usage: bdd files <пакет>"
+    p=$(sanitize "$1")
+    installed "$p" || die "пакет не установлен: $1"
+    cat "$FILES/$p"
+}
+
+# Кто владеет файлом
+cmd_owns() {
+    [ $# -eq 1 ] || die "usage: bdd owns <файл>"
+    # путь можно давать как с ведущим слэшем, так и без
+    target=${1#/}
+    found=0
+    for f in "$FILES"/*; do
+        [ -f "$f" ] || continue
+        if grep -Fxq "$target" "$f" 2>/dev/null; then
+            printf '%s\n' "$(basename "$f")"
+            found=1
+        fi
+    done
+    [ "$found" = 1 ] || printf 'никто не владеет: %s\n' "$1"
+}
+
+# Достать meta пакета: установленного или из репозитория.
+# Печатает путь к файлу meta (во временной папке, если пакет не установлен),
+# поэтому вызывающий обязан убрать TMPMETA.
+TMPMETA=
+pkg_meta() {
+    _p=$(sanitize "$1")
+    if installed "$_p"; then
+        TMPMETA=
+        printf '%s\n' "$DB/$_p"
+        return 0
+    fi
+    _line=$(lookup "$_p") || return 1
+    _d=$(mktemp -d) || die "нет mktemp"
+    fetch "${_line%%|*}" "$_d/pkg" || { rm -rf "$_d"; die "не скачать $_p"; }
+    tar -xzf "$_d/pkg" -C "$_d" meta 2>/dev/null || { rm -rf "$_d"; return 1; }
+    TMPMETA=$_d
+    printf '%s\n' "$_d/meta"
+}
+
+cmd_deps() {
+    [ $# -eq 1 ] || die "usage: bdd deps <пакет>"
+    src=$(pkg_meta "$1") || die "пакет не найден: $1"
+    printf '%s%s%s %s(%s)%s\n' "$C_B" "$1" "$C_RST" "$C_C" \
+        "$(meta_get "$src" version)" "$C_RST"
+    deps=$(meta_get "$src" depends)
+    for dep in $deps; do
+        printf '  %s->%s %s\n' "$C_C" "$C_RST" "$dep"
+        cmd_deps "${dep%%:*}" 2>/dev/null | sed 's/^/    /'
+    done
+    [ -n "$TMPMETA" ] && rm -rf "$TMPMETA"
+    return 0
+}
+
+# Установить один пакет из уже скачанного .bddpkg
+do_install_tarball() {
+    tb=$1
+    p=$2
+    d=$(mktemp -d) || die "нет mktemp"
+    tar -xzf "$tb" -C "$d" || { rm -rf "$d"; die "битый архив: $tb"; }
+
+    [ -f "$d/meta" ] || { rm -rf "$d"; die "в пакете нет meta"; }
+    pname=$(sanitize "$(meta_get "$d/meta" name)")
+    pver=$(meta_get "$d/meta" version)
+    pdeps=$(meta_get "$d/meta" depends)
+    psetuid=$(meta_get "$d/meta" setuid)
+
+    # Пакет с setuid имеет смысл ставить только от root: иначе файл
+    # останется твоим, бит setuid ничего не даст, а sudo перестанет
+    # работать. Лучше отказаться сразу, чем поставить сломанный sud.
+    if [ -n "$psetuid" ] && [ "$(id -u)" != 0 ]; then
+        die "пакет $pname требует root (setuid: $psetuid)
+  поставь так: sudo bdd install $p"
+    fi
+
+    # Раскладываем data/ в корень (или в BDD_ROOT).
+    #
+    # Два решения, и оба вынужденные:
+    #
+    # 1) tar -o («не восстанавливать владельца») обязателен: в архиве uid
+    #    сохранён от того, кто собирал пакет на хосте. Без -o файлы
+    #    И КАТАЛОГИ получили бы чужого владельца (у нас это uid 1000
+    #    вместо root), а на битом setuid-файле это ломает sudo.
+    #
+    # 2) Распаковываем во временный каталог и переносим mv'ом, а не
+    #    сразу на место. mv внутри одной ФС — это rename, то есть
+    #    атомарная операция. Это то, чего в системе нет вообще
+    #    (CONFIG_OVERLAY_FS выключен, поэтому обновления на месте
+    #    невозможны в принципе), но для пакетов rename его заменяет:
+    #    при `bdd install bdd` мы перезаписываем сами себя, и запущенный
+    #    процесс продолжает читать старый файл по своему дескриптору.
+    #    Без rename распаковка вскрыла бы файл, который ash ещё читает.
+    target=$(r /)
+    [ -d "$target" ] || { rm -rf "$d"; die "нет каталога $target"; }
+    stage=$d/stage
+    if [ -d "$d/data" ]; then
+        mkdir -p "$stage" || { rm -rf "$d"; die "нет временного каталога"; }
+        (cd "$d/data" && tar -cf - .) | (cd "$stage" && tar -xf - -o) \
+            || { rm -rf "$d"; die "ошибка распаковки $pname"; }
+
+        # Списки пишем в файлы, а не гоняем по конвейеру: конвейер
+        # исполняет тело while в подшеллке, где exit ничего не значит —
+        # ошибка распаковки молча уехала бы дальше.
+        (cd "$stage" && find . -type d)  | sed 's|^\./||' > "$d/dirs"  || :
+        (cd "$stage" && find . \( -type f -o -type l \)) | sed 's|^\./||' \
+            > "$d/files" || :
+
+        # Каталоги: создаём/правим ДО файлов. Режим берём из stage,
+        # потому что mkdir не берёт режим из архива.
+        while read -r sd; do
+            [ -n "$sd" ] || continue
+            mkdir -p "$target$sd" 2>/dev/null \
+                || { rm -rf "$d"; die "не создать каталог /$sd"; }
+            chmod "$(stat -c %a "$stage/$sd")" "$target$sd" 2>/dev/null || :
+        done < "$d/dirs"
+
+        # Файлы и ссылки: mv = rename, атомарно, права сохраняются
+        # (те же inode'ы, что и в stage).
+        while read -r sf; do
+            [ -n "$sf" ] || continue
+            dst=$target$sf
+            mkdir -p "$(dirname "$dst")" 2>/dev/null || :
+            # На месте файл, а пакет кладёт каталог (или наоборот).
+            # Молчаливый «mv засунул файл внутрь каталога» потом
+            # почти невозможно заметить, поэтому убираем несовпадение.
+            if [ -d "$dst" ] && [ ! -d "$stage/$sf" ]; then
+                rm -rf "$dst" || { rm -rf "$d"; die "не заменить /$sf"; }
+            elif [ -e "$dst" ] && [ -d "$stage/$sf" ]; then
+                rm -f "$dst" || { rm -rf "$d"; die "не заменить /$sf"; }
+            fi
+            mv -f "$stage/$sf" "$dst" \
+                || { rm -rf "$d"; die "не поставить /$sf"; }
+        done < "$d/files"
+    fi
+
+    # setuid-биты из meta: архив их не сохраняет, а для sud это важно
+    for su in $psetuid; do
+        f=$(r "$su")
+        if [ ! -f "$f" ]; then
+            warn "из meta setuid: нет такого файла: $su"
+            continue
+        fi
+        chmod 4755 "$f" && ok "setuid на $su"
+    done
+
+    # Проверяем, что setuid реально сработает: бит может не встать.
+    for su in $psetuid; do
+        f=$(r "$su")
+        [ -f "$f" ] || continue
+        if [ "$(id -u)" = 0 ] && [ ! -u "$f" ]; then
+            die "$su не получил бит setuid, пакет поставлен неверно"
+        fi
+    done
+
+    mkdir -p "$DB" "$FILES"
+    # манифест файлов этого пакета
+    [ -d "$d/data" ] && (cd "$d/data" && find . -type f -o -type l) \
+        | sed 's|^\./||' | sort > "$FILES/$pname"
+    # База хранит meta пакета ЦЕЛИКОМ и дописывает installed_at.
+    # Переписывать по полям нельзя: так уже молча терялись поля,
+    # которых bdd не знает (essential, file_count, arch, built_at),
+    # и `bdd remove bdd` радостно сносил пакетный менеджер.
+    {
+        sed '/^installed_at:/d' "$d/meta"
+        printf 'installed_at: %s\n' "$(date '+%F %T')"
+    } > "$DB/$pname"
+
+    ok "установлен ${C_B}$pname${C_RST} $pver"
+    log "installed $pname $pver"
+    rm -rf "$d"
+}
+
+# Поставить пакет из локального файла .bddpkg
+do_install_local() {
+    f=$1
+    [ -f "$f" ] || die "нет файла: $f"
+    case "$f" in *.bddpkg) ;; *) die "это не .bddpkg: $f" ;; esac
+    info "локальный пакет: $f"
+    tmpm=$(mktemp -d) || die "нет mktemp"
+    tar -xzf "$f" -C "$tmpm" meta 2>/dev/null \
+        || { rm -rf "$tmpm"; die "битый архив: $f"; }
+    pn=$(sanitize "$(meta_get "$tmpm/meta" name)")
+    pv=$(meta_get "$tmpm/meta" version)
+    pdeps=$(meta_get "$tmpm/meta" depends)
+    rm -rf "$tmpm"
+
+    for dep in $pdeps; do
+        dp=${dep%%:*}
+        installed "$dp" || cmd_install "$dp"
+    done
+    do_install_tarball "$f" "$pn"
+    printf '  %s %s\n' "$pn" "$pv"
+}
+
+cmd_install() {
+    [ $# -ge 1 ] || die "usage: bdd install <пакет...>"
+    need_root "установка пакетов" "bdd install $*"
+    ensure_index || :
+    for want in "$@"; do
+        # если это файл на диске — ставим его напрямую, без репозитория
+        if [ -f "$want" ]; then
+            do_install_local "$want"
+            continue
+        fi
+        p=$(sanitize "$want")
+        if installed "$p"; then
+            printf '%s  =%s %s уже установлен\n' "$C_Y" "$C_RST" "$p"
+            continue
+        fi
+        line=$(lookup "$p") || die "пакет не найден: $want (sudo bdd update)"
+        url=${line%%|*}; rest=${line#*|}
+        ver=${rest%%|*}; rest2=${rest#*|}
+        sha=${rest2%%|*}; rest3=${rest2#*|}
+        sz=${rest3%%|*}
+        repo=${rest3#*|}
+
+        info "$p ($ver) из $repo"
+        mkdir -p "$CACHE"
+        pkg="$CACHE/${p}-${ver}.bddpkg"
+        fetch "$url" "$pkg" || die "не скачать $url"
+
+        if [ -n "$sha" ] && [ "$sha" != "-" ]; then
+            got=$(sha256sum "$pkg" | cut -d' ' -f1)
+            if [ "$got" != "$sha" ]; then
+                die "sha256 не совпал для $p
+  ожидалось: $sha
+  получили:  $got
+  скорее всего, индекс старее пакета: sudo bdd update"
+            fi
+            ok "sha256 ок"
+        else
+            warn "в индексе нет sha256 для $p, пропускаю проверку"
+        fi
+
+        # зависимости — ставим рекурсивно перед самим пакетом
+        tmpd=$(mktemp -d)
+        tar -xzf "$pkg" -C "$tmpd" meta 2>/dev/null
+        deps=$(meta_get "$tmpd/meta" depends)
+        for dep in $deps; do
+            dp=${dep%%:*}
+            if ! installed "$dp"; then
+                info "зависимость: $dp"
+                cmd_install "$dp"
+            fi
+        done
+        rm -rf "$tmpd"
+
+        do_install_tarball "$pkg" "$p"
+    done
+}
+
+cmd_remove() {
+    [ $# -ge 1 ] || die "usage: bdd remove [--force] <пакет...>"
+    need_root "удаление пакетов" "bdd remove $*"
+    force=0
+    case "${BDD_ASSUME_YES:-}" in
+        1|y|yes) force=1 ;;
+    esac
+    # --force/-f: не спрашивать и снести даже служебный пакет
+    case "${1:-}" in
+        -f|--force) force=1; shift ;;
+    esac
+    [ $# -ge 1 ] || die "usage: bdd remove [--force] <пакет...>"
+    failed=0
+    for want in "$@"; do
+        p=$(sanitize "$want")
+        # Не упали на первом же отсутствующем: `bdd remove a b` должен
+        # попробовать оба, иначе одной опечаткой не удалишь второй.
+        if ! installed "$p"; then
+            warn "не установлен: $want"
+            failed=1
+            continue
+        fi
+
+        # Служебные пакеты лежат в образе диска ещё ДО установки:
+        # bdd — это сам пакетный менеджер, sud — основа sudo. Их удаление
+        # ломает систему, причём «откатить» уже нечем. Поэтому запрещаем
+        # явно, а не молчаливением.
+        if [ "$(meta_get "$DB/$p" essential)" = yes ] && [ "$force" != 1 ]; then
+            warn "$p — служебный пакет, система без него не работает"
+            warn "  если очень надо: sudo bdd remove --force $p"
+            failed=1
+            continue
+        fi
+
+        # Последний рубеж: не удалять тот файл, который исполняется прямо
+        # сейчас. Поле essential в базе может отсутствовать (пакет ставили
+        # старым bdd, который это поле терял), а удаление себя на ходу —
+        # это дескриптор на уже стёртый inode и невнятная ошибка вместо
+        # результата. -ef сравнивает устройство+inode, а не имя, поэтому
+        # ни симлинк, ни жёсткая ссылка проверку не обойдут.
+        #
+        # В манифесте пути относительные (usr/local/bin/bdd), поэтому
+        # абсолютный путь собираем так же, как это делает удаление ниже:
+        # префикс $(r /) плюс строка манифеста.
+        self=${BDD_SELF:-$(r /usr/local/bin/bdd)}
+        base=$(r /)
+        selfhunt=0
+        if [ -e "$self" ]; then
+            while read -r sf; do
+                [ -n "$sf" ] || continue
+                [ "$base$sf" -ef "$self" ] 2>/dev/null || continue
+                warn "$p: /$sf — это и есть тот bdd, который сейчас работает"
+                warn "  нельзя удалить из-под себя самого"
+                selfhunt=1
+                break
+            done < "$FILES/$p"
+        fi
+        [ "$selfhunt" = 1 ] && { failed=1; continue; }
+        printf 'будут удалены файлы пакета %s:\n' "$p"
+        sed 's/^/  /' "$FILES/$p"
+
+        # проверим, не нужен ли этот пакет кому-то ещё
+        others=""
+        for m in "$DB"/*; do
+            [ -f "$m" ] || continue
+            op=$(basename "$m")
+            [ "$op" = "$p" ] && continue
+            for dep in $(meta_get "$m" depends); do
+                [ "${dep%%:*}" = "$p" ] && others="$others $op"
+            done
+        done
+        if [ -n "$others" ]; then
+            warn "на $p завязаны:$others"
+            if [ "$force" != 1 ]; then
+                printf 'Удалить всё равно? [y/N] '
+                read -r ans
+                case "$ans" in y|Y|yes|Yes) ;; *) printf 'отмена\n'; continue ;; esac
+            fi
+        fi
+
+        # сначала файлы
+        target=$(r /)
+        stuck=""
+        while read -r f; do
+            [ -n "$f" ] || continue
+            if [ -e "$target$f" ] && ! rm -f "$target$f" 2>/dev/null; then
+                stuck="$stuck $f"
+            fi
+            rmdir "$target$(dirname "$f")" 2>/dev/null
+        done < "$FILES/$p"
+        # Остался файл — чаще всего он принадлежит root, а bdd запущен
+        # от пользователя. Молча удалить нельзя, надо сказать.
+        if [ -n "$stuck" ]; then
+            warn "не смог удалить:$stuck"
+            warn "  файлы принадлежат root — удали так: sudo bdd remove $p"
+            failed=1
+            continue
+        fi
+        rm -f "$FILES/$p" "$DB/$p"
+        ok "удалён $p"
+        log "removed $p"
+    done
+    return $failed
+}
+
+cmd_upgrade() {
+    need_root "обновление пакетов" "bdd upgrade $*"
+    cmd_update
+    only=""
+    [ $# -ge 1 ] && [ -n "$1" ] && only=$(sanitize "$1")
+    for m in "$DB"/*; do
+        [ -f "$m" ] || continue
+        p=$(basename "$m")
+        if [ -n "$only" ] && [ "$p" != "$only" ]; then
+            continue
+        fi
+        havev=$(meta_get "$m" version)
+        line=$(lookup "$p") || { printf '%s  %s %s (нет в репозиториях)%s\n' \
+                                     "$C_Y" "$p" "$havev" "$C_RST"; continue; }
+        rest=${line#*|}; newv=${rest%%|*}
+        if [ "$newv" != "$havev" ]; then
+            info "обновляю $p: $havev -> $newv"
+            rm -f "$DB/$p" "$FILES/$p"
+            cmd_install "$p"
+        else
+            printf '%s  =%s %s %s\n' "$C_G" "$C_RST" "$p" "$havev"
+        fi
+    done
+    [ -n "$only" ] || return 0
+    installed "$only" || die "пакет не установлен: $1"
+    return 0
+}
+
+cmd_clean() {
+    if [ -d "$CACHE" ]; then
+        sz=$(du -sh "$CACHE" 2>/dev/null | cut -f1)
+        rm -rf "$CACHE"/* 2>/dev/null
+        ok "кэш очищен (было $sz)"
+    fi
+}
+
+# Разложить исходник пакета в $1/data. Та же раскладка, что в tools/mkrepo.sh:
+#   bin/ → /usr/local/bin, lib/ → /usr/local/lib/<имя>, share/ → ...,
+#   doc/ и исходники → /usr/share/doc/<имя>, файлы без расширения → bin/.
+layout() {
+    _src=$1; _data=$2; _name=$3
+    mkdir -p "$_data" "$_data/usr/local/bin" "$_data/usr/share/doc/$_name"
+
+    [ -d "$_src/bin" ] && copy_tree "$_src/bin" "$_data/usr/local/bin"
+    for sub in lib share doc; do
+        [ -d "$_src/$sub" ] || continue
+        case $sub in
+            lib)   dst="$_data/usr/local/lib/$_name" ;;
+            share) dst="$_data/usr/local/share/$_name" ;;
+            doc)   dst="$_data/usr/share/doc/$_name" ;;
+        esac
+        mkdir -p "$dst"
+        copy_tree "$_src/$sub" "$dst"
+    done
+
+    for f in "$_src"/*; do
+        [ -f "$f" ] || continue
+        b=$(basename "$f")
+        case "$b" in
+            bdd.meta) continue ;;
+            # .bddpkg — это наш же результат сборки. bdd create кладёт
+            # пакет в текущий каталог, и если он совпадает с папкой
+            # исходника, повторная сборка падала бы с «непонятный файл».
+            # Именно так и вышло: собрать пакет дважды подряд было нельзя.
+            *.bddpkg) continue ;;
+            Makefile|makefile|GNUmakefile|*.mk|CMakeLists.txt|meson.build) ;;
+            *.c|*.h|*.S|*.ld|*.pc|*.in|*.txt|*.md|LICENSE|COPYING|README*|INSTALL) ;;
+            *.*) die "непонятный файл в пакете: $b
+  положи его в bin/, lib/, share/, doc/ или убери" ;;
+            *)  cp "$f" "$_data/usr/local/bin/$b"
+                chmod 755 "$_data/usr/local/bin/$b"
+                continue ;;
+        esac
+        cp "$f" "$_data/usr/share/doc/$_name/$b"
+    done
+}
+
+copy_tree() {
+    (cd "$1" && tar -cf - .) | (cd "$2" && tar -xf -)
+}
+
+# Собрать .bddpkg из папки. Метаданные берём из bdd.meta, если есть.
+cmd_create() {
+    [ $# -ge 2 ] || die "usage: bdd create <имя> <папка>"
+    name=$(sanitize "$1")
+    dir=$2
+    [ -d "$dir" ] || die "нет такой папки: $dir"
+    name=$(basename "$(cd "$dir" && pwd)")
+    name=$(sanitize "$name")
+    ver=0.1
+    desc="пакет $name"
+    maint="unknown"
+    deps=""
+    setuid=""
+    essential=""
+    build=""
+    if [ -f "$dir/bdd.meta" ]; then
+        v=$(meta_get "$dir/bdd.meta" version);  [ -n "$v" ]  && ver=$v
+        d=$(meta_get "$dir/bdd.meta" description); [ -n "$d" ] && desc=$d
+        m=$(meta_get "$dir/bdd.meta" maintainer); [ -n "$m" ] && maint=$m
+        dp=$(meta_get "$dir/bdd.meta" depends); [ -n "$dp" ] && deps=$dp
+        s=$(meta_get "$dir/bdd.meta" setuid); [ -n "$s" ] && setuid=$s
+        e=$(meta_get "$dir/bdd.meta" essential); [ -n "$e" ] && essential=$e
+        b=$(meta_get "$dir/bdd.meta" build);   [ -n "$b" ] && build=$b
+    fi
+
+    out=$PWD/$name-$ver.bddpkg
+    work=$(mktemp -d) || die "нет mktemp"
+    src=$work/src
+    stage=$work/stage
+    mkdir -p "$src" "$stage"
+    copy_tree "$dir" "$src"
+    rm -f "$src/bdd.meta"
+
+    if [ -n "$build" ]; then
+        info "сборка: $build"
+        ( cd "$src" && TCC="$BDD_CC" sh -c "$build" ) \
+            || { rm -rf "$work"; die "сборка не удалась"; }
+        chmod -R u+rwX,go+rX "$src"
+        for f in "$src"/bin/*; do
+            [ -f "$f" ] && chmod 755 "$f"
+        done
+    fi
+
+    layout "$src" "$stage/data" "$name"
+
+    isz=$(find "$stage/data" -type f -exec wc -c {} + 2>/dev/null | awk 'END{print $1+0}')
+    nfiles=$(find "$stage/data" \( -type f -o -type l \) | wc -l | tr -d ' ')
+    {
+        printf 'name: %s\n'         "$name"
+        printf 'version: %s\n'      "$ver"
+        printf 'description: %s\n'  "$desc"
+        printf 'maintainer: %s\n'   "$maint"
+        printf 'depends:%s\n'       "${deps:+ $deps}"
+        printf 'installed_size: %s\n' "$isz"
+        printf 'file_count: %s\n'   "$nfiles"
+        [ -n "$setuid" ] && printf 'setuid: %s\n' "$setuid"
+        [ -n "$essential" ] && printf 'essential: %s\n' "$essential"
+        printf 'arch: %s\n'         "$(uname -m 2>/dev/null || echo unknown)"
+        printf 'built_at: %s\n'     "$(date '+%F %T')"
+    } > "$stage/meta"
+    (cd "$stage" && tar -czf "$out" meta data) || die "не собрать архив"
+    sha=$(sha256sum "$out" | cut -d' ' -f1)
+    rm -rf "$work"
+    ok "собран $out"
+    printf '  файлов: %s, размер: %s байт\n' "$nfiles" "$isz"
+    printf '  sha256: %s\n' "$sha"
+    printf '  добавь в репозиторий: %s\n' "$name-$ver.bddpkg"
+}
+
+# ------------------------------------------------------------------- вход
+main() {
+    [ -f /etc/bdd/repos ] || { :; }
+    for d in "$DB" "$FILES" "$INDEX" "$CACHE"; do
+        mkdir -p "$d" 2>/dev/null || :
+    done
+    cmd=${1:-help}
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        help|-h|--help)  cmd_help "$@" ;;
+        update)          cmd_update "$@" ;;
+        upgrade)         cmd_upgrade "$@" ;;
+        install)         cmd_install "$@" ;;
+        remove|rm|uninstall) cmd_remove "$@" ;;
+        list|ls)         cmd_list "$@" ;;
+        search)          cmd_search "$@" ;;
+        info)            cmd_info "$@" ;;
+        files)           cmd_files "$@" ;;
+        deps)            cmd_deps "$@" ;;
+        owns)            cmd_owns "$@" ;;
+        create|build)    cmd_create "$@" ;;
+        repos)           cmd_repos "$@" ;;
+        clean)           cmd_clean "$@" ;;
+        version|--version|-v) printf 'bdd %s\n' "$BDD_VERSION" ;;
+        *)               cmd_help; die "неизвестная команда: $cmd" ;;
+    esac
+}
+
+main "$@"

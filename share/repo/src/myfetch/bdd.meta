@@ -1,0 +1,5 @@
+version: 0.2
+description: Приветствие и инфо о системе для slattware
+maintainer: aetherria
+depends:
+build: mkdir -p bin && $TCC -o bin/myfetch myfetch.c

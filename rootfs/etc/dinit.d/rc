@@ -1,0 +1,14 @@
+# Однократная инициализация при загрузке.
+#
+# Отдельный сервис, потому что у dinit НЕТ настройки bootcmd (это из
+# других систем инициализации). В dinit.conf можно задать только
+# log-type, log-file, log-level — поэтому всё, что должно случиться
+# один раз до появления приглашения, живёт здесь.
+#
+# type = process: /etc/rc.local — внешний скрипт.
+# restart = false: если он упал, второй раз запускать незачем.
+type = process
+command = /etc/rc.local
+restart = false
+waits-for = etc
+waits-for = share

@@ -1,0 +1,6 @@
+# Применяет имя хоста и наполняет /etc/hosts.
+# type = scripted, потому что это shell-скрипт, а не сам dinit.
+type = scripted
+command = /etc/hostname.sh
+restart = false
+waits-for = etc

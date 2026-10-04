@@ -1,0 +1,16 @@
+# fstab для slattware
+#
+# Порядок важен: сначала виртуальные ФС (/proc, /sys, /tmp),
+# потом постоянный диск, потом 9p-шара с хостом.
+
+proc   /proc   proc    defaults        0 0
+sysfs  /sys    sysfs   defaults        0 0
+tmpfs  /tmp    tmpfs   size=64M,mode=1777  0 0
+tmpfs  /run    tmpfs   size=8M,mode=755   0 0
+
+# data.img — постоянное хранилище, НЕ перезаписывается при build.sh
+LABEL=mydata  /home  ext4  defaults,noatime  0 2
+
+# 9p-шара с хостом монтируется сервисом share (/etc/share.sh), а не здесь:
+# на момент mount -a устройство 9p ещё не готово, и mount падает с ошибкой.
+# Строки не должно быть: если нужен другой тег, отредактируй /etc/share.sh.

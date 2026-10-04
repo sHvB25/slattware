@@ -1,0 +1,19 @@
+set editing vi
+set meta-flag on
+"\e[A": previous-history
+"\e[B": next-history
+"\e[C": forward-char
+"\e[D": backward-char
+"\e[3~": delete-char
+"\e[H": beginning-of-line
+"\e[F": end-of-line
+"\e[5~": up-line
+"\e[6~": down-line
+"\e[H": beginning-of-line
+"\e[F": end-of-line
+"\ed": kill-line
+"\e[1;5C": forward-word
+"\e[1;5D": backward-word
+"\e[3;5~": kill-word
+"^[[1~": home
+"^[[4~": end

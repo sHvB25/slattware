@@ -1,0 +1,50 @@
+#!/bin/sh
+# /usr/local/bin/poweroff — выключение системы.
+#
+# ЗАМЕТКА ПРО dinitctl SHUTDOWN
+# Казалось бы, что правильно — вызвать dinitctl shutdown. Но не работает:
+# dinit не может отпустить консоль, пока на ней висит шелл, из которого мы
+# этот вызов и делаем. Получается взаимоблокировка — dinit ждёт консоль,
+# консоль ждёт нас. В итоге VM не гаснет и приходится убивать QEMU.
+#
+# Поэтому делаем так: нетекущие сервисы останавливаем через dinitctl
+# (они завершаются мгновенно), а последний шаг делаем сами — так надёжно
+# и предсказуемо.
+#
+# TODO: когда появится нормальный отпуск консоли, вернуться к
+# dinitctl shutdown. См. TODO.md.
+
+BB=/bin/busybox
+HOST=${HOST:-slattware}
+
+# Остановить всё, кроме сервиса консоли (boot).
+stop_services() {
+    [ -x /bin/dinitctl ] || return 0
+    for s in net share hostname etc; do
+        $BB dinitctl stop "$s" >/dev/null 2>&1
+    done
+}
+
+do_halt() {
+    echo "синхронизирую диски..."
+    $BB sync
+
+    echo "размонтирую файловые системы..."
+    $BB umount -a -r 2>/dev/null
+
+    echo "выключаю $HOST"
+    $BB poweroff -f
+}
+
+case "$1" in
+    -h|--halt)
+        do_halt
+        ;;
+    -r|--reboot)
+        exec /usr/local/bin/reboot
+        ;;
+    *)
+        stop_services
+        do_halt
+        ;;
+esac
