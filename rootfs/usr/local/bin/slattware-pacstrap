@@ -1,0 +1,210 @@
+#!/bin/sh
+# slattware-pacstrap — наполнить корень будущей системы.
+#
+# Аналог pacstrap. Тонкая обёртка над `bdd --root`: создаёт скелет
+# каталогов, копирует /etc и ставит базовые пакеты. Никакой логики
+# установки в нём нет — вся работа у bdd.
+#
+# Скрипт ничего не делает «по-тихому»: перед установкой печатает, что
+# собирается сделать, и спрашивает. Молчаливый запуск не предусмотрен.
+#
+# Использование:
+#   slattware-pacstrap <корень> [пакет...]
+#   sudo slattware-pacstrap /mnt/target
+
+set -e
+
+C_R=; C_G=; C_Y=; C_C=; C_RST=
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
+    C_R=$(printf '\033[31m'); C_G=$(printf '\033[32m')
+    C_Y=$(printf '\033[33m'); C_C=$(printf '\033[36m')
+    C_RST=$(printf '\033[0m')
+fi
+say()  { printf '%s==>%s %s\n' "$C_C" "$C_RST" "$*"; }
+ok()   { printf '%s  ✓%s %s\n' "$C_G" "$C_RST" "$*"; }
+warn() { printf '%s!%s %s\n'   "$C_Y" "$C_RST" "$*" >&2; }
+die()  { printf '%spacstrap:%s %s\n' "$C_R" "$C_RST" "$*" >&2; exit 1; }
+
+# Базовый набор: без него корень нельзя ни загрузить, ни чинить.
+# busybox и musl идут первыми не по важности, а по порядку: без musl
+# не запустится ни один динамический бинарь, а сам bdd — /bin/sh-скрипт,
+# то есть упадёт на первом же вызове sed или grep.
+BASE_DEFAULT="busybox musl dinit bdd sud myfetch"
+
+# Каталоги, которые обязаны существовать в готовой системе.
+# /init — симлинк на /bin/dinit: его ищет initramfs при switch_root.
+DIRS="bin sbin lib usr/bin usr/sbin usr/lib usr/local/bin usr/local/sbin
+      usr/local/lib usr/local/share usr/include usr/share/doc
+      var/lib/bdd var/cache/bdd var/log var/run var/tmp
+      etc/bdd etc/dinit.d etc/skel boot home root srv mnt media
+      dev proc sys run tmp"
+
+usage() {
+    cat <<EOF
+slattware-pacstrap — наполнить корень будущей системы (аналог pacstrap)
+
+  slattware-pacstrap [опции] <корень> [пакет...]
+
+Опции:
+  -b <список>  базовый набор пакетов через пробел
+                по умолчанию: $BASE_DEFAULT
+  -G           скопировать /etc/skel в <корень>/home (как -G у pacstrap)
+  -n           показать план и выйти, ничего не делать
+  -h           эта справка
+
+Что делает:
+  1. проверяет, что корень безопасен для записи
+  2. создаёт скелет каталогов и /init -> /bin/dinit
+  3. копирует /etc живой системы
+  4. пишет /etc/fstab и /etc/bdd/repos — их придётся поправить
+  5. bdd --root <корень> update
+  6. bdd --root <корень> install <базовые> <твои пакеты>
+
+После этого система ещё не загрузочна: поставь ядро и настрой
+загрузчик. Дальше — slattware-chroot.
+EOF
+}
+
+COPY_SKEL=0
+DRY=0
+BASE=$BASE_DEFAULT
+
+while getopts 'b:Gnh' opt; do
+    case "$opt" in
+        b) BASE=$OPTARG ;;
+        G) COPY_SKEL=1 ;;
+        n) DRY=1 ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ $# -ge 1 ] || { usage >&2; exit 1; }
+TARGET=$1
+shift
+WANT="$*"
+
+# ---------------------------------------------------------------- проверки
+# Скрипт работает от root и получает путь аргументом. Здесь нужна
+# осторожность: опечатка в пути — это запись в /usr или rm -rf /.
+
+[ "$(id -u)" = 0 ] || die "нужны права root: sudo slattware-pacstrap ..."
+
+case "$TARGET" in
+    /)  die "корнем не может быть /. Наполняй раздел: /mnt/target" ;;
+    /*) : ;;
+    *)  die "корень должен быть абсолютным путём, а не «$TARGET»" ;;
+esac
+
+TARGET=${TARGET%/}
+[ -n "$TARGET" ] || die "пустой путь"
+
+# Если каталог уже есть и там что-то лежит — это почти наверняка ошибка.
+# Перезаписывать чужую файловую систему молча нельзя.
+if [ -d "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
+    die "$TARGET не пуст.
+  Если это точно та система, которую надо перезаписать, снеси её сам:
+      rm -rf -- $TARGET
+  и зови pacstrap заново. Молча перезаписывать не буду."
+fi
+
+command -v bdd >/dev/null 2>&1 || [ -x /usr/local/bin/bdd ] \
+    || die "нет bdd — запускай из live-окружения, где он есть в PATH"
+
+# ------------------------------------------------------------------- план
+say "корень:  $TARGET"
+say "база:    $BASE"
+[ -n "$WANT" ] && say "сверху:  $WANT"
+say "пакетов: $(echo $BASE $WANT | wc -w)"
+
+if [ "$DRY" = 1 ]; then
+    printf '\n%s--dry-run%s: ничего не меняла.\n' "$C_Y" "$C_RST"
+    exit 0
+fi
+
+printf 'Начать? [y/N/q] '
+read -r a
+case "$a" in
+    y|Y) : ;;
+    q|Q) die "выход по q" ;;
+    *)   die "отмена" ;;
+esac
+
+# ---------------------------------------------------------------- скелет
+mkdir -p "$TARGET"
+for d in $DIRS; do
+    mkdir -p "$TARGET/$d"
+done
+ok "каталоги"
+
+ln -sfn /bin/dinit "$TARGET/init"
+ok "/init -> /bin/dinit"
+
+# ------------------------------------------------------------------- /etc
+# Копируем /etc живой системы целиком: это то же самое, что pacstrap -C.
+# Исключения — fstab и bdd/repos: они описывают конкретную машину
+# (метку диска, путь к репозиторию), и молча тащить их в новую систему
+# нельзя. Ниже записываем заглушки с напоминанием.
+if [ -d /etc ]; then
+    cp -a /etc/. "$TARGET/etc/" 2>/dev/null || cp -R /etc/. "$TARGET/etc/"
+    ok "/etc скопирован"
+fi
+
+warn "fstab и список репозиториев НЕ перенесены — они описывают текущую машину"
+
+cat > "$TARGET/etc/fstab" <<'EOF'
+# fstab для slattware. Создан slattware-pacstrap — проверь и допиши.
+#
+# Виртуальные ФС обязательны: без них не работает dinit.
+proc   /proc  proc    defaults          0 0
+sysfs  /sys   sysfs   defaults          0 0
+tmpfs  /tmp   tmpfs   size=64M,mode=1777 0 0
+tmpfs  /run   tmpfs   size=8M,mode=755  0 0
+
+# Корень и /home — по UUID разделов, которые ты разметил.
+# Узнать: blkid
+# UUID=ЗДЕСЬ        /      ext4  defaults          0 1
+# UUID=ЗДЕСЬ        /home  ext4  defaults,noatime  0 2
+EOF
+ok "etc/fstab — заглушка, допиши UUID"
+
+cat > "$TARGET/etc/bdd/repos" <<EOF
+# Репозитории bdd. Создан slattware-pacstrap — впиши свои.
+#
+# Одна строка — один URL. Поддерживаются file://, http://, https://.
+# Пример для настоящего репозитория:
+#   https://github.com/sHvB25/slattware-repo/raw/main
+EOF
+ok "etc/bdd/repos — пусто, впиши URL"
+
+if [ "$COPY_SKEL" = 1 ] && [ -d /etc/skel ]; then
+    cp -a /etc/skel/. "$TARGET/home/"
+    ok "/etc/skel -> home"
+fi
+
+# --------------------------------------------------------------- пакеты
+say "обновляю индекс"
+bdd --root "$TARGET" update
+
+say "ставлю: $BASE $WANT"
+# shellcheck disable=SC2086  # список пакетов должен разделиться по словам
+bdd --root "$TARGET" install $BASE $WANT
+
+# ---------------------------------------------------------------- итог
+printf '\n%sготово%s  %s\n\n' "$C_G" "$C_RST" "$TARGET"
+say "установлено:"
+bdd --root "$TARGET" list 2>/dev/null | sed 's/^/  /'
+
+cat <<EOF
+
+$(say "ОСТАЛОСЬ СДЕЛАТЬ РУКАМИ")
+
+  1. Поставить ядро и модули: пакет linux, его пока нет.
+  2. Настроить загрузчик на свой раздел.
+  3. Поправить etc/fstab (UUID корня и /home) и etc/bdd/repos (URL).
+  4. Задать пароли: passwd в цели, а не пустые хеши.
+
+  Дальше — войти внутрь:
+      slattware-chroot $TARGET
+EOF
