@@ -5,14 +5,14 @@
 #     meta          — метаданные (ключ: значение, по строке)
 #     data/...      — раскладываемая файловая система
 #
-# Состояние:
+# Состояние (все пути относительны BDD_ROOT, см. --root ниже):
 #     /etc/bdd/repos        список репозиториев, по одному URL на строку
 #     /var/lib/bdd/index/   скачанные индексы (по одному на репозиторий)
 #     /var/lib/bdd/db/      метаданные установленных пакетов
 #     /var/lib/bdd/files/   манифест файлов каждого пакета (для remove)
 #     /var/cache/bdd/       кэш скачанных .bddpkg
 
-BDD_VERSION=0.3
+BDD_VERSION=0.4
 
 # Отладочный след. BDD_X=1 включает `set -x` и уводит stderr в файл
 # $BDD_TRACE (по умолчанию — на общей шаре, чтобы след пережил гостя).
@@ -25,20 +25,62 @@ if [ -n "${BDD_X:-}" ]; then
     set -x
 fi
 
+# --- корень, в который мы ставим -------------------------------------------
+# BDD_ROOT (или --root) — корень, отличный от /. Нужен pacstrap'у: наполняем
+# каталог будущей системы, не трогая live-окружение.
+#
+# Важно: через r() проходят ВСЕ пути состояния — база, манифесты, индексы,
+# кэш, лог, список репозиториев. Иначе файлы пакета уедут в цель, а запись
+# о пакете ляжет в базу живой системы: в цели о нём не узнает никто,
+# и remove/update/list будут работать не с тем.
+#
+# --root разбираем ДО вычисления путей, а не в main(): пути считаются
+# здесь, на третьем экране файла, и к моменту main() они уже готовы.
+BDD_ROOT=${BDD_ROOT:-}
+for _a in "$@"; do
+    case "$_a" in
+        --root=*) BDD_ROOT=${_a#--root=} ;;
+    esac
+done
+_pending=
+for _a in "$@"; do
+    if [ -n "$_pending" ]; then BDD_ROOT=$_a; _pending=; continue; fi
+    case "$_a" in
+        --root|-r) _pending=1 ;;
+    esac
+done
+unset _a _pending
+
+ROOTARG=0
+[ -n "$BDD_ROOT" ] && ROOTARG=1
+
+# Префикс пути к корню, если задан BDD_ROOT.
+r() {
+    if [ "$ROOTARG" = 1 ]; then printf '%s%s' "$BDD_ROOT" "$1"
+    else printf '%s' "$1"; fi
+}
+
 PREFIX=/usr/local
-BD_PREFIX=/var/lib/bdd
+BD_PREFIX=$(r /var/lib/bdd)
 DB=$BD_PREFIX/db
 FILES=$BD_PREFIX/files
 INDEX=$BD_PREFIX/index
-CACHE=/var/cache/bdd
-LOG=/var/log/bdd.log
+CACHE=$(r /var/cache/bdd)
+LOG=$(r /var/log/bdd.log)
 
 # Компилятор для строки build: в bdd.meta. На хосте его подставляет
 # tools/mkrepo.sh, в гостю берётся системный tcc.
 BDD_CC=${BDD_CC:-tcc}
 
 # Репозитории и лог можно переопределить через окружение (BDD_REPOS, BDD_LOG).
-REPOS=${BDD_REPOS:-/etc/bdd/repos}
+#
+# В наполняемом корне /etc/bdd/repos может ещё не быть — тогда берём список
+# живой системы: для pacstrap это как раз то, что нужно, репозиторий лежит
+# на ISO или на 9p-шаре, а в цель попадёт копированием.
+REPOS=${BDD_REPOS:-$(r /etc/bdd/repos)}
+if [ ! -f "$REPOS" ] && [ "$ROOTARG" = 1 ] && [ -f /etc/bdd/repos ]; then
+    REPOS=/etc/bdd/repos
+fi
 LOG=${BDD_LOG:-$LOG}
 
 # --- цвета -----------------------------------------------------------------
@@ -85,17 +127,6 @@ log() {
 
 # --- мелкие помощники -------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
-
-# Пакетный путь. По умолчанию /usr/local — чтобы не мешать базовой системе.
-BDD_ROOT=${BDD_ROOT:-}
-ROOTARG=0
-[ -n "$BDD_ROOT" ] && ROOTARG=1
-
-# Префикс пути к корню, если задан BDD_ROOT.
-r() {
-    if [ "$ROOTARG" = 1 ]; then printf '%s%s' "$BDD_ROOT" "$1"
-    else printf '%s' "$1"; fi
-}
 
 # достать значение ключа из файла meta
 meta_get() {
@@ -230,7 +261,7 @@ cmd_help() {
 ${C_B}bdd $BDD_VERSION${C_RST} — пакетный менеджер slattware
 
 ${C_B}Использование:${C_RST}
-  bdd <команда> [аргументы]
+  bdd [--root <путь>] <команда> [аргументы]
 
 ${C_B}Команды:${C_RST}
   ${C_C}update${C_RST}                обновить индексы репозиториев
@@ -250,16 +281,31 @@ ${C_B}Команды:${C_RST}
   ${C_C}clean${C_RST}                 почистить кэш
   ${C_C}help${C_RST}                  эта справка
 
+${C_B}Общие опции:${C_RST}
+  ${C_C}--root${C_RST} <путь>, ${C_C}-r${C_RST} <путь>
+                              работать не с /, а с указанным корнем:
+                              база, манифесты, индексы, кэш и лог
+                              тоже живут в нём. Для pacstrap.
+  ${C_C}--root=${C_RST}<путь>          то же через знак равенства
+
 ${C_B}Примеры:${C_RST}
   sudo bdd update
   sudo bdd install hello
   bdd search editor
   bdd create mytool ~/Projects/mytool
+  sudo bdd --root /mnt/target install musl busybox dinit bdd sud
 
 ${C_B}Права:${C_RST}
   Установка и удаление меняют систему, поэтому нужен root: sudo bdd ...
   Смотреть можно как есть: bdd list, bdd search, bdd info, bdd files,
   bdd owns, bdd deps, bdd repos, bdd create, bdd help.
+
+${C_B}Окружение:${C_RST}
+  ${C_C}BDD_ROOT${C_RST}     то же, что --root
+  ${C_C}BDD_REPOS${C_RST}    файл со списком репозиториев
+                    (подменяет /etc/bdd/repos)
+  ${C_C}BDD_LOG${C_RST}      файл лога (подменяет /var/log/bdd.log)
+  ${C_C}BDD_CC${C_RST}       компилятор для строки build: в bdd.meta
 
 ${C_B}Раскладка исходника пакета:${C_RST}
   bdd.meta          метаданные; build: — команда сборки, setuid: — файл
@@ -928,7 +974,31 @@ cmd_create() {
 
 # ------------------------------------------------------------------- вход
 main() {
-    [ -f /etc/bdd/repos ] || { :; }
+    # Корень уже разобран в начале файла. Убираем --root/-r и его значение
+    # из аргументов, иначе флаг попадёт в имя команды или пакета.
+    _n=$#
+    while [ "$_n" -gt 0 ]; do
+        case "${1:-}" in
+            --root|-r)
+                shift
+                _n=$((_n - 1))
+                if [ "$_n" -gt 0 ]; then
+                    shift
+                    _n=$((_n - 1))
+                fi
+                continue ;;
+            --root=*)
+                shift
+                _n=$((_n - 1))
+                continue ;;
+        esac
+        _a=$1
+        shift
+        _n=$((_n - 1))
+        set -- "$@" "$_a"
+    done
+    unset _n _a
+
     for d in "$DB" "$FILES" "$INDEX" "$CACHE"; do
         mkdir -p "$d" 2>/dev/null || :
     done
