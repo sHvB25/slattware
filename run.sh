@@ -1,5 +1,5 @@
 #!/bin/sh
-# run.sh — запуск mydistro в QEMU.
+# run.sh — запуск slattware в QEMU.
 #
 #   ./run.sh                 запустить (без пересборки, если образ свежий)
 #   ./run.sh --rebuild       пересобрать initramfs + образ, потом запустить

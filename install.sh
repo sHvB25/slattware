@@ -177,7 +177,7 @@ cap_disk() {
     dd if=/dev/zero of="$DISK" bs=1M count=$((${DISK_SIZE%M})) 2>/dev/null \
         || die "не создать $DISK"
     say "форматирую ext4"
-    as_root mkfs.ext4 -q -F -L mydistro "$DISK" 2>/dev/null \
+    as_root mkfs.ext4 -q -F -L slattware "$DISK" 2>/dev/null \
         || die "не отформатировать (нужны права root)"
     say "диск готов: $(du -h "$DISK" | cut -f1)"
 }

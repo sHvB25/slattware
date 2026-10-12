@@ -156,8 +156,8 @@ sleep 1
 
 echo
 say "форматирую sda1 (система)"
-as_root mkfs.ext4 -q -F -L mydistro "${LOOP}p1" 2>/dev/null \
-    || as_root mkfs.ext4 -q -F -L mydistro "${LOOP}1" 2>/dev/null \
+as_root mkfs.ext4 -q -F -L slattware "${LOOP}p1" 2>/dev/null \
+    || as_root mkfs.ext4 -q -F -L slattware "${LOOP}1" 2>/dev/null \
     || die "не отформатировать раздел системы"
 
 # Метка mydata — не опечатка: /etc/fstab ждёт LABEL=mydata для домашней

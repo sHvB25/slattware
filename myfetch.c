@@ -1,4 +1,4 @@
-/* myfetch.c - маленький fastfetch для mydistro.
+/* myfetch.c - маленький fastfetch для slattware.
  *
  * Идея: программа читает файлы в /proc.
  * А /proc создаёт ТО ЯДРО, которое сейчас запущено.

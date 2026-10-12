@@ -1,5 +1,5 @@
 #!/bin/sh
-# build.sh — сборка mydistro: initramfs + образ корневой ФС.
+# build.sh — сборка slattware: initramfs + образ корневой ФС.
 #
 #   ./build.sh            обновить initramfs и СИНХРОНИЗИРОВАТЬ rootfs в disk.img
 #   ./build.sh --clean    полностью пересоздать disk.img с нуля
@@ -15,8 +15,8 @@ cd "$(dirname "$0")"
 ROOTFS=$PWD/rootfs
 DISK=disk.img
 DATA=data.img
-MNT=${MNT:-/tmp/mydistro-mnt}
-DATA_MNT=${DATA_MNT:-/tmp/mydistro-data}
+MNT=${MNT:-/tmp/slattware-mnt}
+DATA_MNT=${DATA_MNT:-/tmp/slattware-data}
 
 # Размеры образов
 DISK_SIZE=${DISK_SIZE:-512M}
@@ -71,7 +71,7 @@ fresh_disk() {
     rm -f "$DISK"
     dd if=/dev/zero of="$DISK" bs=1M count=$((${DISK_SIZE%M})) 2>/dev/null \
         || die "не создать $DISK"
-    mkfs.ext4 -q -F -L mydistro "$DISK" 2>/dev/null \
+    mkfs.ext4 -q -F -L slattware "$DISK" 2>/dev/null \
         || die "не отформатировать $DISK (ext4 нужен root-доступ или mkfs.ext4)"
 }
 

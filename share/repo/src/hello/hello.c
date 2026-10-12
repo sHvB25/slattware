@@ -2,6 +2,6 @@
 
 int main(void)
 {
-    printf("Привет! Я работаю внутри mydistro.\n");
+    printf("Привет! Я работаю внутри slattware.\n");
     return 0;
 }
