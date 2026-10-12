@@ -6,6 +6,55 @@
 
 BB=/bin/busybox
 
+# --- трассировка -----------------------------------------------------------
+# ПОЧЕМУ ЭТО ЗДЕСЬ. Девять ошибок подряд выглядели одинаково: init
+# стартует и замолкает. По логу QEMU видно только одно — упал или нет,
+# — и причину приходилось угадывать. Каждая догадка стоила полного
+# цикла «пересобрать initramfs → загрузить в QEMU → смотреть», а
+# циклов ушло больше, чем следовало.
+#
+# Теперь init сам говорит, где находится. Если он умрёт — в логе
+# будет последняя напечатанная строка, и это будет ответ, а не
+# предмет догадок.
+#
+# Трассировка включается переменной init_trace в /proc/cmdline или
+# аргументом, чтобы можно было грузиться и без неё:
+#     init=/init slattware-live init_trace
+#
+# Каждая строка печатается ДО действия. Если после неё тишина —
+# значит умерло именно на этом действии.
+
+trace_on=
+for _t in "$@"; do
+    case "$_t" in
+        init_trace) trace_on=1 ;;
+    esac
+done
+
+# Метку init_trace тоже читаем из аргументов, а не из /proc/cmdline:
+# /proc на момент старта init ещё не смонтирован.
+for _a in "$@"; do
+    case "$_a" in
+        slattware-live) live_mode=1 ;;
+        root=*)         root_arg=$_a ;;
+    esac
+done
+
+step() {
+    [ -n "$trace_on" ] || return 0
+    $BB echo "[init] $*"
+}
+
+fail() {
+    $BB echo "[init] СБОЙ: $*"
+    $BB echo "[init] init дальше работать не может."
+    # Не спим вечно молча: оставляем консоль в виду и ждём, чтобы
+    # человек увидел причину и мог перезагрузиться.
+    $BB sh -c "while :; do $BB sleep 1; done"
+}
+
+step "стартовал, аргументы = [$*]"
+
 # --- /dev -----------------------------------------------------------------
 # devtmpfs ОБЯЗАТЕЛЬНО идёт первым: именно он создаёт /dev/vda, /dev/ttyS0
 # и остальные узлы. Без него блочных устройств просто не существует,
@@ -45,14 +94,10 @@ $BB mkdir -p /newroot
 # Поэтому метку передаём самим init — аргументом. Это надёжнее чтения
 # файла: не зависит от порядка монтирований и работает одинаково.
 #
-#   init=/init slattware-live      — обычная загрузка с диска
 #   init=/init slattware-live      — Live CD, корень из liveroot.cpio.gz
-for _a in "$@"; do
-    case "$_a" in
-        slattware-live) live_mode=1 ;;
-        root=*)         root_arg=$_a ;;
-    esac
-done
+#
+# (разбор аргументов — выше, вместе с трассировкой; второй раз он тут
+#  стоял и перетирал первый, из-за чего init_trace не включался)
 
 if [ -n "$live_mode" ]; then
     # Перенаправлять вывод в /dev/ttyS0 НЕ нужно и даже вредно.
@@ -62,7 +107,7 @@ if [ -n "$live_mode" ]; then
     # init и так наследует stdout ядра, а тот уже привязан к консолям
     # из параметров ядра. Молчание init означает, что он не дошёл, а
     # не что ему некуда писать.
-    $BB echo "режим: Live CD, корень из live-root"
+    step "режим Live CD: корень из live-root"
 
     # Живая система приходит вторым архивом и лежит в initramfs под
     # /liveroot.cpio.gz. Распаковываем прямо в /newroot.
@@ -76,7 +121,7 @@ if [ -n "$live_mode" ]; then
     # в ошибку, init на этом месте умирал, и всё выглядело как «init
     # стартует и молчит». Поэтому cd в подкаталоге, а не -D.
     if [ -f /liveroot.cpio.gz ]; then
-        $BB echo "распаковываю живую систему из /liveroot.cpio.gz"
+        step "распаковываю /liveroot.cpio.gz"
 
         # /newroot ОБЯЗАТЕЛЬНО должен быть точкой монтирования, иначе
         # switch_root откажется: «NEW_ROOT must be a mountpoint» — он
@@ -85,25 +130,22 @@ if [ -n "$live_mode" ]; then
         #
         # В обычной загрузке /newroot — точка монтирования раздела.
         # В Live CD диска нет, поэтому монтируем tmpfs: система целиком
-        # в памяти, что для Live CD и правильно. Файлы распаковываются
-        # уже в tmpfs, а не в rootfs initramfs.
-        $BB mount -t tmpfs -o size=256M tmpfs /newroot || {
-            $BB echo "не смог смонтировать tmpfs на /newroot"
-            $BB sh -c "while :; do $BB sleep 1; done"
-        }
+        # в памяти, что для Live CD и правильно.
+        step "монтирую tmpfs на /newroot (точка монтирования для switch_root)"
+        $BB mount -t tmpfs -o size=256M tmpfs /newroot \
+            || fail "не смог смонтировать tmpfs на /newroot"
 
+        step "распаковываю live-root в /newroot"
         $BB gzip -dc /liveroot.cpio.gz | (cd /newroot && $BB cpio -idm) 2>/dev/null
         _rc=$?
         if [ ! -x /newroot/bin/busybox ]; then
-            $BB echo "cpio не справился (rc=$_rc), пробую tar"
+            step "cpio не справился (rc=$_rc), пробую tar"
             $BB mkdir -p /newroot
             $BB gzip -dc /liveroot.cpio.gz | (cd /newroot && $BB tar xf -) 2>/dev/null
         fi
-        if [ ! -x /newroot/bin/busybox ]; then
-            $BB echo "НЕ РАСПАКОВАЛСЯ /liveroot.cpio.gz"
-            $BB sh -c "while :; do $BB sleep 1; done"
-        fi
-        $BB echo "живая система распакована"
+        [ -x /newroot/bin/busybox ] \
+            || fail "НЕ РАСПАКОВАЛСЯ /liveroot.cpio.gz (rc=$_rc)"
+        step "живая система распакована, в корне $($BB ls /newroot | $BB wc -l) записей"
     else
         $BB echo "нет /liveroot.cpio.gz — метка slattware-live есть, живой системы нет."
         $BB echo "Пересобери ISO: ./tools/mkiso.sh"
@@ -111,21 +153,51 @@ if [ -n "$live_mode" ]; then
     fi
 
     # /dev переезжает в корень, иначе узлы устройств останутся в initramfs.
-    $BB mount -t devtmpfs devtmpfs /newroot/dev
-    $BB mount -t proc proc /newroot/proc
-    $BB mount -t sysfs sysfs /newroot/sys
-    $BB mount -t tmpfs -o size=16M,mode=755 tmpfs /newroot/run
-    $BB mount -t tmpfs -o size=64M,mode=1777 tmpfs /newroot/tmp
+    #
+    # ВАЖНО: точек монтирования в live-root НЕТ, и bdd их не создаёт —
+    # он раскладывает только файлы пакетов, а не каркас системы. При
+    # обычной загрузке /newroot — раздел с готовым корнем, и dev/proc/sys
+    # там уже есть. В Live CD корня на диске нет, и каталогов нет тоже:
+    # mount без существующей цели падает с ENOENT.
+    #
+    # На это ушло несколько итераций вслепую, пока в init не появилась
+    # трассировка: без неё был виден только паник ядра.
+    step "создаю точки монтирования в /newroot"
+    for _d in dev proc sys run tmp; do
+        $BB mkdir -p "/newroot/$_d" || fail "не создать /newroot/$_d"
+    done
+
+    step "монтирую виртуальные ФС в /newroot"
+    $BB mount -t devtmpfs devtmpfs /newroot/dev || fail "devtmpfs в /newroot/dev"
+    $BB mount -t proc proc /newroot/proc             || fail "proc в /newroot/proc"
+    $BB mount -t sysfs sysfs /newroot/sys           || fail "sysfs в /newroot/sys"
+    $BB mount -t tmpfs -o size=16M,mode=755 tmpfs /newroot/run   || fail "run"
+    $BB mount -t tmpfs -o size=64M,mode=1777 tmpfs /newroot/tmp || fail "tmp"
 
     # Апплеты: в live-root они уже есть (пакет busybox ставит их), но
     # лишний --install не помешает и закроет случай, если сборка
     # живой системы когда-нибудь будет неполной.
+    step "ставлю апплеты busybox в /newroot/bin"
     $BB --install -s /newroot/bin
 
-$BB echo "живая система готова, передаю управление dinit"
+    step "проверяю, что в корне есть /init"
+    # Именно -L, а не -e. /init это СИМЛИНК на /bin/dinit, путь
+    # АБСОЛЮТНЫЙ, и до switch_root он резолвится от /, а не от
+    # /newroot. Поэтому [ -e /newroot/init ] даёт ложь: dinit-то есть,
+    # но по пути /bin/dinit, которого в initramfs нет и не должно быть.
+    #
+    # Проверять надо dinit по месту: он лежит в корне живой системы.
+    [ -L /newroot/init ]    || fail "в /newroot нет /init — dinit не запустится"
+    [ -x /newroot/bin/dinit ] \
+        || fail "/newroot/init есть, но /newroot/bin/dinit не исполняем"
+
+    step "вызываю switch_root в /newroot /init"
     # Метку пробрасываем аргументом: switch_root свои аргументы после
     # /init не передаёт, и живая система решила бы, что она не live.
     exec $BB switch_root -c /dev/console /newroot /init slattware-live
+    # Сюда не дойдём: exec не возвращается. Если вернулся — значит
+    # switch_root отказался, и без fail() init просто вышел бы молча.
+    fail "switch_root вернулся с кодом $? — он не сменил корень"
 fi
 
 # Ищем корень перебором, а не одним устройством.

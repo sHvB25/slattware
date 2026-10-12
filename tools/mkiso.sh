@@ -165,6 +165,51 @@ warn "утилиты разметки ($LIVE_TOOLS) не поставлены: �
 # скопирует его в целевую систему, поэтому он должен быть тут полным.
 cp -a "$ROOT/rootfs/etc" "$bddroot/etc"
 
+# fstab для Live CD — НЕ копия системного.
+#
+# Системный fstab описывает /home как отдельный раздел с меткой mydata.
+# На Live CD раздела нет: корень целиком в tmpfs, и /home уже создан.
+# Если оставить строку с LABEL=mydata, mountall (сервис etc) упадёт,
+# и в логе будет «Service etc terminated with exit code 1».
+#
+# Виртуальные ФС тоже монтировать не нужно: initramfs уже смонтировал
+# proc, sys, dev, run и tmp до switch_root. Повторный mount -a поверх
+# них — лишнее и лишняя точка отказа.
+cat > "$bddroot/etc/fstab" <<'EOF'
+# fstab для Live CD.
+#
+# Пусто не случайно: initramfs смонтировал /proc, /sys, /dev, /run и
+# /tmp ДО switch_root, а корень лежит в tmpfs. Монтировать тут нечего.
+#
+# Строка с меткой mydata из системного fstab тут не работает: раздела
+# /home на Live CD нет, и mountall упадёт с exit code 1.
+EOF
+
+# /init — симлинк на /bin/dinit. Его ищет initramfs при switch_root,
+# поэтому без него живую систему не запустить.
+#
+# Раньше его создавал slattware-pacstrap, а этот скрипт наполняет корень
+# напрямую через bdd и про pacstrap не знает. На выходе было 6 записей
+# и ни одного /init: init доходил до проверки и останавливался.
+ln -sfn /bin/dinit "$bddroot/init"
+
+# Каталоги- точки монтирования. bdd раскладывает только файлы пакетов,
+# а каркас системы — не его дело; init потом требует эти каталоги
+# готовыми, иначе mount падает с ENOENT.
+for d in dev proc sys run tmp boot root srv mnt media; do
+    mkdir -p "$bddroot/$d"
+done
+
+# Домашний каталог пользователя. Без него login не пускает в сессию:
+# «login: can't change directory to '/home/slat'».
+#
+# /home на настоящей установке — отдельный раздел, и pacstrap кладёт
+# каталоги сам. На Live CD раздела нет, поэтому создаём минимальный
+# HOME: системе он не нужен, нужен чтобы зайти.
+mkdir -p "$bddroot/home/slat"
+cp -a "$ROOT/rootfs/etc/skel/." "$bddroot/home/slat/" 2>/dev/null || :
+ok "/init, точки монтирования и /home/slat на месте"
+
 # Скрипты установки — то, ради чего всё затевалось.
 mkdir -p "$bddroot/usr/local/bin"
 cp "$ROOT/rootfs/usr/local/bin/slattware-pacstrap" "$bddroot/usr/local/bin/"
@@ -188,10 +233,15 @@ ok "репозиторий: $(ls "$bddroot/opt/repo" | wc -l | tr -d ' ') фай
 # Живая система как отдельный архив: его init монтирует как /newroot
 # в режиме Live CD и передаёт ему /init.
 #
-# node-узлы (/dev/console) внутри тут не нужны и невозможны: devtmpfs
-# монтируется уже поверх, а узлы в архиве были бы вторым источником
-# правды. Поэтому find -type f и -type l, без устройств.
-( cd "$bddroot" && find . \( -type f -o -type l \) | sort \
+# Узлы устройств (/dev/console) внутри тут не нужны и невозможны:
+# devtmpfs монтируется уже поверх, а узлы в архиве были бы вторым
+# источником правды.
+#
+# Каталоги ВКЛЮЧЕНЫ обязательно. При списке только -type f -o -type l
+# пустые каталоги в архив не попадают: cpio создаёт каталог лишь когда
+# внутри него что-то лежит. Так терялся /home/slat — он пуст, потому
+# что /etc/skel тоже пуст — и login писал «can't change directory».
+( cd "$bddroot" && find . -type d -o -type f -o -type l | sort \
     | cpio -o -H newc 2>/dev/null ) | gzip -1 > "$OUT/live-root.cpio.gz"
 ok "live-root $(du -h "$OUT/live-root.cpio.gz" | cut -f1)"
 
