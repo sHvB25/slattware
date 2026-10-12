@@ -12,7 +12,122 @@ BB=/bin/busybox
 # и монтирование корня падает с "Can't lookup blockdev".
 $BB mount -t devtmpfs devtmpfs /dev
 
+# --- точка монтирования корня ----------------------------------------------
+# Каталог для switch_root ОБЯЗАТЕЛЬНО должен существовать. В initramfs,
+# собранном вручную через cpio, его нет: cpio кладёт в архив только то,
+# что мы перечислили, а /newroot в списке не значился.
+#
+# ВАЖНО вызывать mkdir через $BB: в initramfs лежит только один файл
+# /bin/busybox, отдельных программ нет, и голое `mkdir` завершает скрипт
+# с «not found». Из-за этого init умирал ДО первой строки вывода —
+# ядро писало «Attempted to kill init» с кодом 0, и диагностировать
+# пришлось по косвенным признакам.
+$BB mkdir -p /newroot
+
 # --- корень ---------------------------------------------------------------
+# ЯДРО ЖИВЫХ СРЕД. Если в метке ядра есть slattware-live, то это Live CD:
+# корня на диске искать не надо, надо взять корень из initramfs.
+#
+# Проверка по метке в /proc/cmdline, а не по флажку из grub.cfg: метка
+# не зависит от того, кто и как запускает ядро, и потому не забывается.
+#
+# Здесь нужен не print, а переход: раньше блок только печатал «режим:
+# Live CD», а потом исполнение падало в общий поиск /dev/vda — диска
+# на Live CD нет, и init завершался, не дойдя до switch_root.
+# Отсюда и был «init used greatest stack depth» вместо оболочки.
+# ЖИВОЙ РЕЖИМ ОПРЕДЕЛЯЕТСЯ БЕЗ /proc.
+#
+# /proc/cmdline читать нельзя: на этой строке /proc ещё не смонтирован,
+# и cat возвращает «can't open /proc/cmdline». Тогда live_mode всегда
+# пуст, init уходит искать /dev/vda, которого на Live CD нет, и весь
+# режим молча не работает.
+#
+# Поэтому метку передаём самим init — аргументом. Это надёжнее чтения
+# файла: не зависит от порядка монтирований и работает одинаково.
+#
+#   init=/init slattware-live      — обычная загрузка с диска
+#   init=/init slattware-live      — Live CD, корень из liveroot.cpio.gz
+for _a in "$@"; do
+    case "$_a" in
+        slattware-live) live_mode=1 ;;
+        root=*)         root_arg=$_a ;;
+    esac
+done
+
+if [ -n "$live_mode" ]; then
+    # Перенаправлять вывод в /dev/ttyS0 НЕ нужно и даже вредно.
+    # Проба с `exec > /dev/ttyS0` была лишней: если exec не срабатывает,
+    # скрипт умирает ДО первого echo, и в логе это выглядит как «init
+    # стартовал и замолчал» — самая запутанная картина из возможных.
+    # init и так наследует stdout ядра, а тот уже привязан к консолям
+    # из параметров ядра. Молчание init означает, что он не дошёл, а
+    # не что ему некуда писать.
+    $BB echo "режим: Live CD, корень из live-root"
+
+    # Живая система приходит вторым архивом и лежит в initramfs под
+    # /liveroot.cpio.gz. Распаковываем прямо в /newroot.
+    #
+    # Отдельный архив нужен потому, что этот initramfs — общий для
+    # двух случаев: обычной загрузки с диска и Live CD. В обычном
+    # случае живую систему берём с раздела, и лишние 7 МБ в initramfs
+    # были бы ballast'ом, который мы грузили бы в память зря.
+    #
+    # ВАЖНО: у busybox-cpio НЕТ опции -D. `cpio -idm -D /newroot` уходит
+    # в ошибку, init на этом месте умирал, и всё выглядело как «init
+    # стартует и молчит». Поэтому cd в подкаталоге, а не -D.
+    if [ -f /liveroot.cpio.gz ]; then
+        $BB echo "распаковываю живую систему из /liveroot.cpio.gz"
+
+        # /newroot ОБЯЗАТЕЛЬНО должен быть точкой монтирования, иначе
+        # switch_root откажется: «NEW_ROOT must be a mountpoint» — он
+        # печатает справку и выходит, init dies с SIGHUP, и в логе это
+        # выглядит как «init исчез молча».
+        #
+        # В обычной загрузке /newroot — точка монтирования раздела.
+        # В Live CD диска нет, поэтому монтируем tmpfs: система целиком
+        # в памяти, что для Live CD и правильно. Файлы распаковываются
+        # уже в tmpfs, а не в rootfs initramfs.
+        $BB mount -t tmpfs -o size=256M tmpfs /newroot || {
+            $BB echo "не смог смонтировать tmpfs на /newroot"
+            $BB sh -c "while :; do $BB sleep 1; done"
+        }
+
+        $BB gzip -dc /liveroot.cpio.gz | (cd /newroot && $BB cpio -idm) 2>/dev/null
+        _rc=$?
+        if [ ! -x /newroot/bin/busybox ]; then
+            $BB echo "cpio не справился (rc=$_rc), пробую tar"
+            $BB mkdir -p /newroot
+            $BB gzip -dc /liveroot.cpio.gz | (cd /newroot && $BB tar xf -) 2>/dev/null
+        fi
+        if [ ! -x /newroot/bin/busybox ]; then
+            $BB echo "НЕ РАСПАКОВАЛСЯ /liveroot.cpio.gz"
+            $BB sh -c "while :; do $BB sleep 1; done"
+        fi
+        $BB echo "живая система распакована"
+    else
+        $BB echo "нет /liveroot.cpio.gz — метка slattware-live есть, живой системы нет."
+        $BB echo "Пересобери ISO: ./tools/mkiso.sh"
+        $BB sh -c "while :; do $BB sleep 1; done"
+    fi
+
+    # /dev переезжает в корень, иначе узлы устройств останутся в initramfs.
+    $BB mount -t devtmpfs devtmpfs /newroot/dev
+    $BB mount -t proc proc /newroot/proc
+    $BB mount -t sysfs sysfs /newroot/sys
+    $BB mount -t tmpfs -o size=16M,mode=755 tmpfs /newroot/run
+    $BB mount -t tmpfs -o size=64M,mode=1777 tmpfs /newroot/tmp
+
+    # Апплеты: в live-root они уже есть (пакет busybox ставит их), но
+    # лишний --install не помешает и закроет случай, если сборка
+    # живой системы когда-нибудь будет неполной.
+    $BB --install -s /newroot/bin
+
+$BB echo "живая система готова, передаю управление dinit"
+    # Метку пробрасываем аргументом: switch_root свои аргументы после
+    # /init не передаёт, и живая система решила бы, что она не live.
+    exec $BB switch_root -c /dev/console /newroot /init slattware-live
+fi
+
 # Ищем корень перебором, а не одним устройством.
 #
 # Почему перебор: у нас два возможных вида корня, и оба должны работать.
@@ -24,6 +139,15 @@ $BB mount -t devtmpfs devtmpfs /dev
 #
 # Порядок важен: сначала разделённый вариант, потому что метка LABEL=
 # проверяется на каждом кандидате — так мы не смонтируем что попало.
+#
+# Список кандидатов шире, чем просто vda, потому что эта же система
+# должна грузиться с Live CD на чужом железе. Под QEMU корни всегда
+# /dev/vda*, но на реальной машине это /dev/nvme0n1p2, /dev/sda1 или
+# даже /dev/sdb3 — имя нигде не записано, его узнать неоткуда.
+#
+# Поэтому: сначала пробуем известное (быстро, без вопросов), а если не
+# нашлось — перечисляем все разделы и даём выбрать руками. Это ровно
+# то место, где конструктор должен уступить человеку решение.
 for dev in /dev/vda1 /dev/vda; do
     [ -b "$dev" ] || continue
     if $BB mount -t ext4 "$dev" /newroot 2>/dev/null; then
@@ -33,14 +157,41 @@ for dev in /dev/vda1 /dev/vda; do
 done
 
 if [ -z "$ROOTDEV" ]; then
-    echo "НЕ НАШЁЛ КОРЕНЬ: пробовал /dev/vda1 и /dev/vda"
-    echo "что есть на диске:"
-    $BB ls /dev/vd* 2>&1
-    # Пауза, чтобы не долбить в консоль. $BB подставляется, а не остаётся
-    # литералом: кавычки должны быть двойные.
-    $BB sh -c "while :; do $BB sleep 1; done"
+$BB echo
+$BB echo "=========================================================="
+    $BB echo " [А-Яа-я]втоматически корень не найден."
+    $BB echo " [А-Яа-я]кажи раздел с корнем — так быстрее, чем выбирать из списка."
+$BB echo "=========================================================="
+$BB echo
+    $BB echo "Разделы, которые видны:"
+    for p in $($BB ls /dev/sd* /dev/nvme* /dev/hd* /dev/vd* 2>/dev/null); do
+        [ -b "$p" ] || continue
+        $BB echo "  $p"
+    done
+
+    while :; do
+        $BB printf 'корень (например /dev/sda1 или nvme0n1p2): '
+        _ans=$(read -r line 2>/dev/null) || _ans=""
+        [ -n "$_ans" ] || continue
+        # Без ведущего /dev — не беда, допишем.
+        case "$_ans" in
+            /*) _dev=$_ans ;;
+            *)  _dev=/dev/$_ans ;;
+        esac
+        if [ ! -b "$_dev" ]; then
+            $BB echo "нет такого устройства: $_dev"
+            continue
+        fi
+        if $BB mount -t ext4 "$_dev" /newroot 2>/dev/null; then
+            ROOTDEV=$_dev
+            break
+        fi
+        $BB echo "не ext4 или не корень: $_dev"
+        $BB umount /newroot 2>/dev/null || :
+    done
+    $BB echo "корень: $ROOTDEV"
 fi
-echo "корень: $ROOTDEV"
+$BB echo "корень: $ROOTDEV"
 
 # /dev переезжает в новый корень, иначе узлы устройств останутся в initramfs.
 $BB mount -t devtmpfs devtmpfs /newroot/dev
