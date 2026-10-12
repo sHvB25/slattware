@@ -48,18 +48,21 @@ say "defconfig"
 ( cd "$TREE" && make x86_64_defconfig ) >/dev/null
 
 # --- 2. наш фрагмент поверх ------------------------------------------------
-# merge_config.sh спросит про новые символы и оставит их пустыми —
+# merge_config спросит про новые символы и оставит их пустыми —
 # поэтому отвечаем заранее, иначе он зависнет на stdin.
 say "накладываю config/linux.config"
 ( cd "$TREE" && \
-  yes "" | ./scripts/kconfig/merge_config.sh -m -O . "$FRAG" .config \
+  yes "" | ./scripts/kconfig/merge_config.sh -m -O . "$FRAG" \
 ) >/dev/null 2>&1 || true
 
-# merge_config пересобирает .config только через make oldconfig. Без
-# явного oldconfig символы, которых не было в defconfig, просто не
-# появятся — и мы получим ядро без AMDGPU, молча.
-say "oldconfig"
-( cd "$TREE" && yes "" | make oldconfig ) >/dev/null
+# merge_config берёт на вход СПИСОК фрагментов и сам знает, что .config
+# — цель. Передавать .config ещё и как фрагмент нельзя: он попадёт в
+# список источников и перезапишет наш фрагмент старыми значениями.
+#
+# Симптом был тихий и коварный: фрагмент проверялся на настоящие символы
+# и проходил, а в .config оказывалось «# CONFIG_DRM_AMDGPU is not set».
+say "olddefconfig"
+( cd "$TREE" && yes "" | make olddefconfig ) >/dev/null
 
 # --- 3. проверяем, что критичное реально включилось -------------------------
 # Шаг не параноидальный. merge_config на несуществующее имя молча
@@ -74,13 +77,24 @@ say "проверяю символы фрагмента по Kconfig"
 # в Kconfig иначе. Их не ловим.
 bogus=
 for c in $(grep -oE '^CONFIG_[A-Z_0-9]+' "$FRAG" | sort -u); do
+    # grep -r, а НЕ find -exec grep {} +.
+    #
+    # Причина: grep -q завершается на первом совпадении и закрывает stdin.
+    # find с -exec {} + скармливает файлы пачкой через pipe, и на закрытом
+    # stdin find умирает от SIGPIPE — вся конструкция возвращает
+    # не-nonzero СЛУЧАЙНО. На относительном пути попадало, на абсолютном
+    # нет, и выглядело так, будто символов нет вообще. grep -r читает до
+    # конца и гонок не создаёт.
+    #
+    # (menu)?config, а не просто config. Многие символы объявляются как
+    # menuconfig — NLS, INPUT_KEYBOARD, ATA, CRYPTO, CGROUPS — и проверка
+    # без menu выдавала их за выдуманные.
+    #
     # Отступ обязателен: config внутри menu идёт с ведущим пробелом
     # (drivers/ata/Kconfig — «config ATA_PIIX»), а config верхнего
-    # уровня — без него. Без учёта отступа ATA_PIIX и BLK_DEV_SD
-    # выглядят несуществующими.
-    find "$TREE" -name Kconfig -exec \
-        grep -qE "^[[:space:]]*config ${c#CONFIG_}\$" {} + 2>/dev/null \
-        || bogus="$bogus $c"
+    # уровня — без него.
+    grep -rqE "^[[:space:]]*(menu)?config ${c#CONFIG_}\$" --include=Kconfig "$TREE" \
+        2>/dev/null || bogus="$bogus $c"
 done
 if [ -n "$bogus" ]; then
     warn "в config/linux.config есть символы, которых нет в дереве ядра:"
