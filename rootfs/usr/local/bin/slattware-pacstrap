@@ -67,6 +67,9 @@ EOF
 
 COPY_SKEL=0
 DRY=0
+# Откуда брать репозиторий, если в live-окружении нет /etc/bdd/repos.
+# Пусто означает «спросить пользователя, а не молча идти в интернет».
+REPO_URL=${REPO_URL:-}
 BASE=$BASE_DEFAULT
 
 while getopts 'b:Gnh' opt; do
@@ -103,10 +106,35 @@ TARGET=${TARGET%/}
 # Если каталог уже есть и там что-то лежит — это почти наверняка ошибка.
 # Перезаписывать чужую файловую систему молча нельзя.
 if [ -d "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
-    die "$TARGET не пуст.
+    # lost+found — НЕ содержимое.
+    #
+    # mkfs.ext4 создаёт его в пустой ФС всегда, без исключений, и
+    # mkfs.xfs, mkfs.btrfs — тоже. То есть каталог, который pacstrap
+    # чаще всего и получает, всегда «не пуст», и проверка отказывала
+    # на САМОМ ЧАСТОМ пути: отформатировал раздел, примонтировал,
+    # позвал pacstrap — отказ.
+    #
+    # Проверка отказывает, только если внутри есть что-то, кроме
+    # lost+found. Защита от перезаписи чужой системы сохраняется:
+    # если там файлы или другие каталоги, вопрос остаётся.
+    # || : обязателен.
+    #
+    # grep -vx возвращает 1, когда ничего не осталось — а это и есть
+    # хороший случай: в каталоге только lost+found, содержимого нет.
+    # Под set -e присваивание с неудачной подстановкой прерывает
+    # скрипт, и pacstrap умирал молча: rc=1, ноль строк вывода, ничего
+    # не сделано. Отличить «отказал» от «упал» было нечем.
+    _other=$(ls -A "$TARGET" 2>/dev/null | grep -vx lost+found) || :
+    if [ -n "$_other" ]; then
+        die "$TARGET не пуст (внутри: $(printf '%s' "$_other" | tr '\n' ' ')).
   Если это точно та система, которую надо перезаписать, снеси её сам:
       rm -rf -- $TARGET
   и зови pacstrap заново. Молча перезаписывать не буду."
+    fi
+    # lost+found удаляем: в корне системы он не нужен, а лишний
+    # каталог в / мешает при сравнении корней и добавляет его в
+    # любое «что тут лежит».
+    rm -rf "$TARGET/lost+found" 2>/dev/null || :
 fi
 
 command -v bdd >/dev/null 2>&1 || [ -x /usr/local/bin/bdd ] \
@@ -151,6 +179,24 @@ if [ -d /etc ]; then
     ok "/etc скопирован"
 fi
 
+# Инструменты конструктора — в цель.
+#
+# Без них следующий шаг не выполняется: внутри chroot зовётся
+# slattware-grub-install, а он живёт в /usr/local/bin ЖИВОЙ системы,
+# а в цели её нет. chroot видит только свою файловую систему, и
+# скрипт кончается на
+#     /bin/sh: /usr/local/bin/slattware-grub-install: not found
+#
+# Копируем только slattware-*: это инструменты установки, и они нужны
+# в цели на время настройки. bdd в цели уже стоит пакетом.
+mkdir -p "$TARGET/usr/local/bin"
+_copied=
+for _t in /usr/local/bin/slattware-*; do
+    [ -f "$_t" ] || continue
+    cp -a "$_t" "$TARGET/usr/local/bin/" && _copied="$_copied $(basename "$_t")"
+done
+[ -n "$_copied" ] && ok "инструменты в цели:$_copied"
+
 warn "fstab и список репозиториев НЕ перенесены — они описывают текущую машину"
 
 cat > "$TARGET/etc/fstab" <<'EOF'
@@ -169,14 +215,48 @@ tmpfs  /run   tmpfs   size=8M,mode=755  0 0
 EOF
 ok "etc/fstab — заглушка, допиши UUID"
 
-cat > "$TARGET/etc/bdd/repos" <<EOF
+# --- репозитории -----------------------------------------------------------
+# Берём их из LIVE-ОКРУЖЕНИЯ, а не просим вписать вручную.
+#
+# Раньше здесь писался пустой файл, и pacstrap был неспособен ничего
+# поставить: следующая строка зовёт `bdd update`, который на пустом
+# списке репозиториев отвечает «список репозиториев пуст» и выходит.
+# То есть основной инструмент установки не работал на основном пути —
+# отформатировал, смонтировал, позвал pacstrap, и всё.
+#
+# Так и в Arch: pacstrap берёт репозитории у ЖИВОЙ системы (pacman.conf
+# через --config), а не у целевой. Целевой машине репозиторий ещё не
+# нужен — ей нужно получить первый набор пакетов.
+#
+# Порядок: сначала ставим пакеты, потом просим дописать fstab и URL.
+LIVE_REPOS=/etc/bdd/repos
+if [ -f "$LIVE_REPOS" ] && [ -s "$LIVE_REPOS" ] \
+   && grep -qv '^[[:space:]]*#' "$LIVE_REPOS" 2>/dev/null; then
+    mkdir -p "$TARGET/etc/bdd"
+    cp "$LIVE_REPOS" "$TARGET/etc/bdd/repos"
+    ok "etc/bdd/repos — взят из live-окружения"
+else
+    # Нечем взять: ставим репозиторий вручную через переменную
+    # окружения, иначе установка не пойдёт дальше этой строки.
+    if [ -n "$REPO_URL" ]; then
+        mkdir -p "$TARGET/etc/bdd"
+        printf '%s\n' "$REPO_URL" > "$TARGET/etc/bdd/repos"
+        ok "etc/bdd/repos — $REPO_URL (из \$REPO_URL)"
+    else
+        cat > "$TARGET/etc/bdd/repos" <<EOF
 # Репозитории bdd. Создан slattware-pacstrap — впиши свои.
 #
 # Одна строка — один URL. Поддерживаются file://, http://, https://.
 # Пример для настоящего репозитория:
 #   https://github.com/sHvB25/slattware-repo/raw/main
 EOF
-ok "etc/bdd/repos — пусто, впиши URL"
+        die "в live-окружении нет /etc/bdd/repos, и REPO_URL не задан.
+  Неоткуда взять пакеты — установка невозможна.
+  Либо впиши репозиторий в /etc/bdd/repos на live-системе,
+  либо запусти так:
+      REPO_URL=file:///opt/repo slattware-pacstrap $TARGET"
+    fi
+fi
 
 if [ "$COPY_SKEL" = 1 ] && [ -d /etc/skel ]; then
     cp -a /etc/skel/. "$TARGET/home/"
@@ -200,9 +280,9 @@ cat <<EOF
 
 $(say "ОСТАЛОСЬ СДЕЛАТЬ РУКАМИ")
 
-  1. Поставить ядро и модули: пакет linux, его пока нет.
-  2. Настроить загрузчик на свой раздел.
-  3. Поправить etc/fstab (UUID корня и /home) и etc/bdd/repos (URL).
+  1. Поставить ядро:        bdd install linux
+  2. Поставить загрузчик:    bdd install grub && slattware-grub-install /dev/sdX
+  3. Проверить etc/fstab:    он заполнен, но проверь UUID /home.
   4. Задать пароли: passwd в цели, а не пустые хеши.
 
   Дальше — войти внутрь:

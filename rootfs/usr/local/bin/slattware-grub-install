@@ -29,18 +29,66 @@
 # уровень контроля.
 set -e
 
-die() { printf 'slattware-grub-install: %s\n' "$*" >&2; exit 1; }
+die()  { printf 'slattware-grub-install: %s\n' "$*" >&2; exit 1; }
+ok()   { printf '  ✓ %s\n' "$*"; }
+warn() { printf '  ! %s\n' "$*" >&2; }
+
+# --- разбор опций ----------------------------------------------------------
+# --root <каталог>  grub-install запускается СНАРУЖИ этой системы, с
+#                   --root-directory=<каталог>.
+#
+# Почему это нужно. Внутри chroot grub-probe сопоставляет устройство,
+# которое видит хост, с тем, что GRUB увидит при загрузке, и на
+# chroot-образе не справляется: grub-install радостно пишет
+#     Installation finished. No error reported.
+# не создаёт device.map, не пишет prefix — и машина не грузится:
+#     error: file `/vmlinuz' not found
+# Ядро и initrd при этом лежат на месте; не находит их только загрузчик
+# с неверным префиксом. device.map и grub-editenv это не чинят:
+# префикс в BIOS-режиме вшит в core.img, а не в переменные окружения.
+#
+# --root решает это честно: grub-install запускается там, где он видит
+# настоящую смонтированную систему, и сам вычисляет префикс.
+DESTROOT=/
+
+while [ $# -ge 1 ]; do
+    case "$1" in
+        --root) DESTROOT=${2:?нужен каталог}; shift 2 ;;
+        --root=*) DESTROOT=${1#--root=}; shift ;;
+        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+[ -d "$DESTROOT" ] || die "нет каталога --root: $DESTROOT"
+[ -w "$DESTROOT" ] || die "нет прав писать в --root: $DESTROOT (нужен root)"
 
 # --- где мы ----------------------------------------------------------------
 # Корень chroot. Все пути дальше — относительно него, иначе grub.cfg
 # и fstab получат пути хостовой системы, и система после установки
 # будет грузиться с чужой файловой системой.
-ROOT=$(awk '$2 == "/" && $3 !~ /^proc/ {print $1; exit}' /proc/mounts) \
-    && : || ROOT=
-# /proc/mounts в chroot описывает корень chroot. Имя устройства нужно
-# для root= в grub.cfg, а каталог — для работы с файлами.
-ROOTDEV=$ROOT
-[ -n "$ROOTDEV" ] || die "не вижу корень в /proc/mounts"
+# --- что ставим и на чём корень -------------------------------------------
+# Аргумент трактуется как «устройство с корнем»: из него получается и
+# раздел для root= в grub.cfg, и диск для MBR.
+#
+# Если аргумента нет, корень ищется в /proc/mounts — но только тогда, когда
+# /proc вообще есть. При `slattware-chroot -n` его не монтируют, и чтение
+# падало с awk: /proc/mounts: No such file or directory, хотя всё нужное
+# было передано аргументом.
+ARG=${1:-}
+if [ -n "$ARG" ]; then
+    ROOTDEV=$ARG
+elif [ -r /proc/mounts ]; then
+    ROOTDEV=$(awk '$2 == "/" && $3 !~ /^(proc|sysfs|devpts|tmpfs)/ {print $1; exit}' \
+              /proc/mounts) || :
+    [ -n "$ROOTDEV" ] || die "не вижу корень в /proc/mounts"
+    printf 'устройство не указано, корень на %s\n' "$ROOTDEV"
+else
+    die "не указан раздел и нет /proc/mounts — неоткуда взять корень.
+  usage: slattware-grub-install /dev/sdX1
+  (а каталог /proc не смонтирован: slattware-chroot -n его не трогает)"
+fi
 
 # --- диск ------------------------------------------------------------------
 # Из раздела получаем диск, на котором стоит GRUB.
@@ -68,11 +116,7 @@ disk_of() {
         *) printf '%s' "$_d" ;;
     esac
 }
-DISK=${1:-}
-if [ -z "$DISK" ]; then
-    DISK=$(disk_of "$ROOTDEV")
-    printf 'устройство не указано, корень на %s → диск %s\n' "$ROOTDEV" "$DISK"
-fi
+DISK=$(disk_of "$ROOTDEV")
 [ -b "$DISK" ] || die "нет такого блочного устройства: $DISK"
 [ -b "$ROOTDEV" ] || die "нет такого блочного устройства: $ROOTDEV (корень)"
 
@@ -80,20 +124,39 @@ fi
 # Проверяем ДО установки GRUB. Если ядра нет, grub-install отработает
 # успешно, загрузчик встанет — и машина не загрузится, потому что
 # нечего грузить. Объяснять это потом будет нечем.
-[ -f /boot/vmlinuz ]     || die "в /boot нет vmlinuz — поставь пакет linux: bdd install linux"
-[ -f /boot/initrd.img ] || die "в /boot нет initrd.img"
-[ -x /sbin/grub-install ] || [ -x /usr/sbin/grub-install ] \
-    || die "в системе нет grub-install"
-GRUB_INSTALL=$(command -v grub-install)
+[ -f "$DESTROOT/boot/vmlinuz" ]     || die "в /boot нет vmlinuz — поставь пакет linux: bdd install linux"
+[ -f "$DESTROOT/boot/initrd.img" ] || die "в /boot нет initrd.img"
+
+# grub-install ищем ЧЕРЕЗ PATH, а не в /sbin и /usr/sbin.
+# Бинари пакетов в slattware лежат в /usr/local/bin — это соглашение
+# mkrepo.sh, и grub ничем от прочих не отличается. Проверка только по
+# sbin выдавала «в системе нет grub-install» при установленном пакете:
+#     ✓ установлен grub 2.14
+#     slattware-grub-install: в системе нет grub-install
+GRUB_INSTALL=$(command -v grub-install 2>/dev/null) || :
+[ -n "$GRUB_INSTALL" ] && [ -x "$GRUB_INSTALL" ] \
+    || die "в системе нет grub-install — поставь пакет grub: bdd install grub"
 
 # --- режим загрузки --------------------------------------------------------
-# EFI и BIOS — разные установки GRUB в разные места. Определяем по
-# наличию /sys/firmware/efi: там EFI-система сообщает о себе.
-if [ -d /sys/firmware/efi ]; then
-    EFI=1
-else
-    EFI=0
-fi
+# EFI и BIOS — разные установки GRUB в разные места.
+#
+# По умолчанию смотрим /sys/firmware/efi: так сообщает о себе система,
+# на которой мы работаем. Внутри chroot /sys подмонтирован от ХОСТА,
+# и это правильно для установки себе же — но не для установки на
+# внешний диск для другой машины. Тогда задай явно:
+#
+#   SLAT_EFI=0 slattware-grub-install /dev/sdb1     установить как BIOS
+#   SLAT_EFI=1 slattware-grub-install /dev/nvme0n1p1   как EFI
+#
+# Без этого флага установка на внешний диск для EFI-машины ставила бы
+# EFI-загрузчик, а грузиться с него потом будет BIOS-машина.
+case "${SLAT_EFI:-auto}" in
+    0) EFI=0 ;;
+    1) EFI=1 ;;
+    *)
+        if [ -d /sys/firmware/efi ]; then EFI=1; else EFI=0; fi
+        ;;
+esac
 
 # --- fstab -----------------------------------------------------------------
 # Пишем по факту смонтированного, а не по шаблону: устройство и метку
@@ -104,6 +167,24 @@ fi
 # мешают: на Live CD именно из-за строки LABEL=mydata сервис etc падал.
 ROOT_UUID=$(blkid -s UUID -o value "$ROOTDEV" 2>/dev/null || true)
 [ -n "$ROOT_UUID" ] || die "не смог прочитать UUID у $ROOTDEV"
+
+# Что писать в root= в grub.cfg.
+#
+# НЕ имя устройства. При установке на образ это /dev/loop0p1, а в
+# загруженной машине раздел называется /dev/vda1 — имя из установки
+# просто не существует. С меткой такого не происходит: метка живёт на
+# самой ФС.
+#
+# Метки может не быть (раздел форматировали без неё) — тогда UUID.
+# UUID надёжнее имени и всегда есть у свежесозданной ФС.
+ROOT_LABEL=$(blkid -s LABEL -o value "$ROOTDEV" 2>/dev/null || true)
+if [ -n "$ROOT_LABEL" ]; then
+    ROOTSPEC=LABEL=$ROOT_LABEL
+    ok "root= в grub.cfg: LABEL=$ROOT_LABEL"
+else
+    ROOTSPEC=UUID=$ROOT_UUID
+    ok "root= в grub.cfg: UUID=$ROOT_UUID (метки у раздела нет)"
+fi
 
 {
     echo "# fstab — создан slattware-grub-install $(date '+%F %T')"
@@ -124,7 +205,7 @@ ROOT_UUID=$(blkid -s UUID -o value "$ROOTDEV" 2>/dev/null || true)
             echo "UUID=$BOOT_UUID /boot ext4 defaults,noatime 0 2"
         fi
     fi
-} > /etc/fstab
+} > "$DESTROOT/etc/fstab"
 
 # --- grub.cfg --------------------------------------------------------------
 # console=tty0 ПЕРВЫМ: ядро открывает только первую указанную консоль,
@@ -139,41 +220,206 @@ ROOT_UUID=$(blkid -s UUID -o value "$ROOTDEV" 2>/dev/null || true)
 # root= — устройство корня. Не UUID: init в initramfs ищет корень сам,
 # перебором /dev/vda1, /dev/vda и далее, и root= тут только снимает
 # сообщение ядра «VFS: Unable to mount root fs».
-mkdir -p /boot/grub
-cat > /boot/grub/grub.cfg <<EOF
+mkdir -p "$DESTROOT/boot/grub"
+
+# Имя раздела в нотации GRUB.
+#
+# Команда linux берёт путь ОТ $root, а не от $prefix. Это разные
+# переменные: префикс говорит, где нашёлся grub.cfg, а $root — на каком
+# разделе искать ядро. Без явного $root получалось ровно это:
+#     error: file `/vmlinuz' not found
+# при том, что grub.cfg найден, меню показано, а vmlinuz лежит рядом.
+#
+# Вариант с `search --file /vmlinuz` (как делает grub-mkconfig) тоже не
+# спасает: search перебирает дискеты и упирается в fd0 —
+#     biosdisk_rw: failure reading sector 0x0 from `fd0'
+#     grub_search_fs_file: no such device: /vmlinuz
+#
+# Поэтому $root задаётся явно, числом раздела. (hd0) — первый диск в
+# порядке BIOS; при нескольких дисках поправить придётся в этом файле,
+# и grub-install об этом предупредит.
+_PART=${ROOTDEV##*[^0-9]}
+[ -n "$_PART" ] || _PART=1
+_PTTYPE=${PTTYPE:-}
+if [ -z "$_PTTYPE" ]; then
+    _PTTYPE=$(blkid -p -s PTTYPE -o value "$DISK" 2>/dev/null) || _PTTYPE=dos
+fi
+case "$_PTTYPE" in
+    gpt) _GDEV="(hd0,gpt${_PART})" ;;
+    *)   _GDEV="(hd0,msdos${_PART})" ;;
+esac
+
+# Дополнительные консоли через переменную окружения.
+#
+# Ядро открывает ТОЛЬКО ПЕРВУЮ указанную консоль. На живой машине это
+# console=tty0 — правильно и достаточно. Но под QEMU -nographic, где
+# видна только последовательная консоль, вывода не будет вовсе, и
+# загрузка выглядит как «машина зависла молча», хотя она работает.
+#
+#   SLAT_EXTRA_CONSOLE="console=ttyS0,115200n8" slattware-grub-install ...
+EXTRA=${SLAT_EXTRA_CONSOLE:-}
+EXTRA=${EXTRA:+ $EXTRA}
+
+cat > "$DESTROOT/boot/grub/grub.cfg" <<EOF
 # grub.cfg — создан slattware-grub-install $(date '+%F %T')
 # Файл написан руками. grub-mkconfig не зовём: он собирает конфиг из
 # чужих скриптов в /etc/grub.d и требует grub-probe, который должен
-# видеть примонтированную систему. Здесь всё наоборот — три строки, и
+# видеть примонтированную систему. Здесь всё наоборот — строк мало, и
 # мы знаем их значения.
+
 set timeout=5
 set default=0
 
+# Модули в core.img встроены при установке (--modules в
+# slattware-grub-install). З insmod НЕ нужен: без него grub-install
+# встраивает минимальный набор, search и чтение ext2 не работают, и
+# GRUB отвечает «file \`/vmlinuz' not found».
+
 menuentry "slattware" {
-    linux  /vmlinuz console=tty0 root=$ROOTDEV rw nohz=off quiet
-    initrd /initrd.img
+    set root=$_GDEV
+    linux  /boot/vmlinuz console=tty0 $EXTRA root=$ROOTSPEC rw nohz=off quiet
+    initrd /boot/initrd.img
 }
 
 menuentry "slattware (отладка)" {
-    linux  /vmlinuz console=tty0 root=$ROOTDEV rw nohz=off loglevel=7
-    initrd /initrd.img
+    set root=$_GDEV
+    linux  /boot/vmlinuz console=tty0 $EXTRA root=$ROOTSPEC rw nohz=off loglevel=7
+    initrd /boot/initrd.img
 }
 EOF
+ok "grub.cfg: root=$_GDEV (таблица $_PTTYPE, раздел $_PART)"
 
 # --- установка GRUB --------------------------------------------------------
 if [ "$EFI" = 1 ]; then
-    # --removable кладёт загрузчик в EFI-раздел, названный по имени
-    # диска. Без этого файл называется EFI/BOOTX64.EFI на разделе с
-    # меткой ESP, и если метка не та, прошивка загрузку не найдёт.
     echo "==> EFI: ставлю GRUB в $DISK"
-    "$GRUB_INSTALL" --target=x86_64-efi --efi-directory=/boot \
-                     --bootloader-id=slattware --reusable "$DISK"
-    echo "==> копирую загрузчик в EFI/BOOT/BOOTX64.EFI (запасной путь)"
-    mkdir -p /boot/EFI/BOOT
-    cp -f /boot/EFI/slattware/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+    # --no-nvram: запись переменных загрузчика требует efivarfs и
+    # работает не везде. Без неё загрузчик кладётся обычным файлом и
+    # грузится по --bootloader-id, что переносимо на любой EFI.
+    "$GRUB_INSTALL" --target=x86_64-efi --efi-directory="$DESTROOT/boot" \
+                     --bootloader-id=slattware --no-nvram "$DISK"
+    # Запасной путь: прошивка ищет EFI/BOOT/BOOTX64.EFI независимо от
+    # --bootloader-id. Без этого файла UEFI-машина не находит загрузчик
+    # и падает в «no bootable device», хотя EFI/slattware/ на месте.
+    if [ -f "$DESTROOT/boot/EFI/slattware/grubx64.efi" ]; then
+        mkdir -p "$DESTROOT/boot/EFI/BOOT"
+        cp -f "$DESTROOT/boot/EFI/slattware/grubx64.efi" "$DESTROOT/boot/EFI/BOOT/BOOTX64.EFI"
+        ok "запасной путь /boot/EFI/BOOT/BOOTX64.EFI"
+    else
+        warn "не нашёл /boot/EFI/slattware/grubx64.efi — запасной путь не создан"
+    fi
 else
+    # GPT + BIOS — требует раздел bios_grub.
+    #
+    # На GPT место для ядра загрузчика не берётся «между разделами»,
+    # там нет зазора. GRUB просит отдельный раздел типа ef02, и без
+    # него отказывается работать:
+    #     warning: this GPT partition label contains no BIOS Boot Partition
+    #     error: will not proceed with blocklists
+    #
+    # Проверяем заранее и говорим что делать, вместо того чтобы
+    # показывать warning и error от grub-install.
+    PTTYPE=$(blkid -p -s PTTYPE -o value "$DISK" 2>/dev/null) || PTTYPE=
+    if [ "$PTTYPE" = gpt ] && ! lsblk -no PARTTYPE "$ROOTDEV" 2>/dev/null \
+                          | grep -qi bios_grub; then
+        die "диск $DISK размечен как GPT, а ставим BIOS-загрузчик.
+  GRUB некуда встроить: на GPT нет зазора между разделами, нужен
+  отдельный раздел bios_grub (тип ef02, 1-2 МБ, НЕ ФОРМАТИРОВАТЬ).
+
+  Разметить его, например так (cfdisk -> создать -> тип bios_grub):
+      sfdisk $DISK <<< 'label: gpt, size=2MiB, type=ef02'
+
+  Либо проще — поставь загрузчик в EFI-режиме, если машина его
+  поддерживает (на новых ноутбуках почти всегда да):
+      SLAT_EFI=1 slattware-grub-install $ROOTDEV
+
+  Либо переразметь диск под MBR (label: dos) — потеряешь GPT."
+    fi
     echo "==> BIOS: ставлю GRUB в MBR $DISK"
-    "$GRUB_INSTALL" --target=i386-pc --reusable "$DISK"
+    # --root-directory и --boot-directory обязательны, когда скрипт
+    # запущен снаружи (--root): grub-install обязан видеть
+    # ПРИМОНТИРОВАННУЮ систему, иначе он вычисляет префикс по
+    # устройству хоста и встраивает его в core.img неверно.
+    # --modules: перечисляем модули ЯВНО.
+    #
+    # core.img, который grub-install встраивает по умолчанию, содержит
+    # минимальный набор. Нашего конфига он не обслуживает:
+    #     insmod part_msdos   ← модуля нет, insmod молча ничего не делает
+    #     insmod ext2
+    #     search --file /vmlinuz   ← ищет, но файловых систем не видит
+    # и GRUB отвечает ровно тем же, что и раньше:
+    #     error: file `/vmlinuz' not found
+    #
+    # grub.cfg читается — до поиска ядра дело не доходит.
+    # ИМЕНА МОДУЛЕЙ, А НЕ ТАК КАК ХОЧЕТСЯ.
+#
+# Модуля part_msdos в GRUB 2.x НЕТ: разбор MBR называется msdospart.
+# Список проверяется по наличию файлов, и отсутствующий part_msdos
+# молча выпадал — GRUB оставался без разбора таблицы разделов и не мог
+# открыть свой же раздел:
+#     error: file `/vmlinuz' not found
+# при menuscreen на месте и vmlinuz рядом с grub.cfg.
+GRUB_MODULES="msdospart part_gpt ext2 fat ntfs iso9660
+                  search search_fs_uuid search_fs_file search_label
+                  linux normal configfile echo test terminal serial
+                  biosdisk lvm mdraid09 raid loadenv"
+
+    # Оставляем только те модули, что реально есть на диске.
+    #
+    # Набор GRUB у Alpine урезан: raid.mod там нет, и grub-install падает
+    # целиком на отсутствующем файле:
+    #     error: cannot open `/usr/lib/grub/i386-pc/raid.mod'
+    # Один необязательный модуль срывал установку целиком, включая
+    # обязательные ext2 и msdospart.
+    MODDIR=$DESTROOT/usr/lib/grub/i386-pc
+    _kept=$DESTROOT/usr/lib/grub/.modules.$$
+    for m in $GRUB_MODULES; do
+        [ -f "$MODDIR/$m.mod" ] && printf '%s\n' "$m" >> "$_kept"
+    done
+    GRUB_MODULES=$(tr '\n' ' ' < "$_kept")
+    rm -f "$_kept"
+
+    # «Хоть один модуль нашёлся» — проверка недостаточная. Нужны все
+    # обязательные: без разбора разделов и без ext2 GRUB не прочитает
+    # ФС, и машина не загрузится. Поэтому проверяем именно их, и
+    # отсутствие объясняем, а не оставляем на загрузку.
+    for m in msdospart ext2 linux normal configfile biosdisk; do
+        [ -f "$MODDIR/$m.mod" ] || die "в $MODDIR нет модуля $m.mod
+  Без него GRUB не сможет прочитать файловую систему и загрузка
+  закончится на «file \`/vmlinuz' not found»."
+    done
+
+    if [ "$DESTROOT" != / ]; then
+        "$GRUB_INSTALL" --target=i386-pc --modules="$GRUB_MODULES" \
+            --root-directory="$DESTROOT" \
+            --boot-directory="$DESTROOT/boot" "$DISK"
+    else
+        "$GRUB_INSTALL" --target=i386-pc --modules="$GRUB_MODULES" "$DISK"
+    fi
+
+    # grub-install внутри chroot часто НЕ создаёт device.map и не пишет
+    # prefix: grub-probe не может сопоставить устройство хоста с тем, что
+    # GRUB увидит при загрузке. При этом grub-install радостно рапортует
+    # «Installation finished. No error reported.», а машина потом не
+    # грузится:
+    #
+    #     error: file `/vmlinuz' not found
+    #
+    # Ядро и initrd лежат на месте — не найти их может только загрузчик,
+    # у которого неверный префикс. Поэтому задаём отображение и префикс
+    # явно, а не полагаемся на probe.
+    #
+    # (hd0) — так GRUB называет первый диск в режиме BIOS. Для UEFI это
+    # другое имя, там EFI-загрузчик ищет по путям внутри EFI-раздела, и
+    # device.map не нужен.
+    if [ ! -f "$DESTROOT/boot/grub/device.map" ]; then
+        printf '(hd0) %s\n' "$DISK" > "$DESTROOT/boot/grub/device.map"
+        ok "device.map создан: (hd0) $DISK"
+    fi
+    if command -v grub-editenv >/dev/null 2>&1; then
+        grub-editenv "$DISK" set prefix="(hd0)/boot" >/dev/null 2>&1 \
+            && ok "prefix в MBR: (hd0)/boot" \
+            || warn "не смог записать prefix в MBR"
+    fi
 fi
 
 echo
