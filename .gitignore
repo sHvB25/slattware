@@ -54,6 +54,18 @@ bzImage
 #     ./tools/build-kernel.sh && ./tools/mklinux-pkg.sh
 /share/repo/src/linux/boot/
 
+# --- Модули GRUB -----------------------------------------------------------
+# 1216 файлов на 12 МБ: копируются с хоста и лежат в дереве проекта
+# только ради сборки пакета grub. В git им не место по той же причине,
+# что и ядру — обновление GRUB раздувало бы историю на 12 МБ.
+#
+# Добываются заново:
+#     mkdir -p share/repo/src/grub/grubmod
+#     cp -a /usr/lib/grub/i386-pc /usr/lib/grub/x86_64-efi \
+#           share/repo/src/grub/grubmod/
+#     ./tools/mkrepo.sh grub
+/share/repo/src/grub/grubmod/
+
 # --- Сборка Live CD: mkiso.sh собирает заново ------------------------------
 /build-iso/
 *.iso
