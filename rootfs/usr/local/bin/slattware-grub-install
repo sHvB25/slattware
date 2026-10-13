@@ -1,0 +1,188 @@
+#!/bin/sh
+# slattware-grub-install — поставить загрузчик GRUB на систему.
+#
+#   slattware-grub-install [устройство]
+#
+# Зовётся ВНУТРИ chroot, после pacstrap и `bdd install linux`:
+#
+#   slattware-pacstrap /mnt
+#   slattware-chroot /mnt
+#   # ...внутри chroot...
+#   bdd install linux
+#   slattware-grub-install /dev/sda
+#   exit
+#
+# Устройство можно не указывать: возьмём раздел с корнем и отбросим
+# номер раздела. Указывать надо, когда корень не на первом разделе или
+# система на LVM, а разбираться с этим скрипт не берётся.
+#
+# ЧТО ТУТ СВОЕ, А ЧТО ЧУЖОЕ
+#
+# Своё — grub.cfg. Мы пишем его руками, а не зовём grub-mkconfig.
+# grub-mkconfig собирает конфиг из чужих скриптов в /etc/grub.d и
+# полагается на grub-probe, который должен видеть примонтированную
+# систему. Обе зависимости мы не контролируем, а grub.cfg — файл из
+# трёх строк, и его проще написать, чем угадывать.
+#
+# Чужое — сам GRUB. grub-install кладёт свой код в MBR или в EFI, и
+# писать свой загрузчик мы не станем: это не наша задача и не наш
+# уровень контроля.
+set -e
+
+die() { printf 'slattware-grub-install: %s\n' "$*" >&2; exit 1; }
+
+# --- где мы ----------------------------------------------------------------
+# Корень chroot. Все пути дальше — относительно него, иначе grub.cfg
+# и fstab получат пути хостовой системы, и система после установки
+# будет грузиться с чужой файловой системой.
+ROOT=$(awk '$2 == "/" && $3 !~ /^proc/ {print $1; exit}' /proc/mounts) \
+    && : || ROOT=
+# /proc/mounts в chroot описывает корень chroot. Имя устройства нужно
+# для root= в grub.cfg, а каталог — для работы с файлами.
+ROOTDEV=$ROOT
+[ -n "$ROOTDEV" ] || die "не вижу корень в /proc/mounts"
+
+# --- диск ------------------------------------------------------------------
+# Из раздела получаем диск, на котором стоит GRUB.
+#
+# СХЕМЫ РАЗДЕЛОВ РАЗНЫЕ, и это главная причина, почему здесь нельзя
+# просто отрезать хвост из цифр:
+#
+#   /dev/sda1      → раздел, отделяем 1        → /dev/sda
+#   /dev/nvme0n1p3 → раздел, отделяем p3       → /dev/nvme0n1
+#   /dev/nvme0n1   → ЦЕЛЫЙ диск, ничего не отделяем
+#   /dev/mmcblk0p1 → раздел, отделяем p1       → /dev/mmcblk0
+#
+# Один только sed 's/[0-9]*$//' даёт /dev/nvme0n — потеряна единица,
+# и grub-install уходит на несуществующее устройство.
+#
+# Порядок проверок: сначала «есть p перед цифрами» — это nvme и mmc,
+# у них разделитель p. Остальное — sd/hd/vd, у них разделитель сама
+# цифра. Всё, что не подошло, считаем уже диском и не трогаем.
+disk_of() {
+    _d=$1
+    case "$_d" in
+        *p[0-9]) printf '%s' "$_d" | sed 's/p[0-9]*$//' ;;
+        */sd[a-z]*|*/hd[a-z]*|*/vd[a-z]*)
+            printf '%s' "$_d" | sed 's/[0-9]*$//' ;;
+        *) printf '%s' "$_d" ;;
+    esac
+}
+DISK=${1:-}
+if [ -z "$DISK" ]; then
+    DISK=$(disk_of "$ROOTDEV")
+    printf 'устройство не указано, корень на %s → диск %s\n' "$ROOTDEV" "$DISK"
+fi
+[ -b "$DISK" ] || die "нет такого блочного устройства: $DISK"
+[ -b "$ROOTDEV" ] || die "нет такого блочного устройства: $ROOTDEV (корень)"
+
+# --- что в /boot -----------------------------------------------------------
+# Проверяем ДО установки GRUB. Если ядра нет, grub-install отработает
+# успешно, загрузчик встанет — и машина не загрузится, потому что
+# нечего грузить. Объяснять это потом будет нечем.
+[ -f /boot/vmlinuz ]     || die "в /boot нет vmlinuz — поставь пакет linux: bdd install linux"
+[ -f /boot/initrd.img ] || die "в /boot нет initrd.img"
+[ -x /sbin/grub-install ] || [ -x /usr/sbin/grub-install ] \
+    || die "в системе нет grub-install"
+GRUB_INSTALL=$(command -v grub-install)
+
+# --- режим загрузки --------------------------------------------------------
+# EFI и BIOS — разные установки GRUB в разные места. Определяем по
+# наличию /sys/firmware/efi: там EFI-система сообщает о себе.
+if [ -d /sys/firmware/efi ]; then
+    EFI=1
+else
+    EFI=0
+fi
+
+# --- fstab -----------------------------------------------------------------
+# Пишем по факту смонтированного, а не по шаблону: устройство и метку
+# знает только реальная система, а шаблон был бы второй правдой.
+#
+# Копить надо только то, что переживёт перезагрузку. /proc, /sys, /tmp,
+# /run монтирует mountall (сервис etc) — они в fstab не нужны и только
+# мешают: на Live CD именно из-за строки LABEL=mydata сервис etc падал.
+ROOT_UUID=$(blkid -s UUID -o value "$ROOTDEV" 2>/dev/null || true)
+[ -n "$ROOT_UUID" ] || die "не смог прочитать UUID у $ROOTDEV"
+
+{
+    echo "# fstab — создан slattware-grub-install $(date '+%F %T')"
+    echo
+    echo "# Корень. UUID, а не /dev/sdaN: буквы дисков приходят и уходят"
+    echo "# при переподключении, а UUID привязан к самой ФС."
+    echo "UUID=$ROOT_UUID / ext4 defaults,noatime 0 1"
+    echo
+    echo "# Виртуальные ФС монтирует /etc/mountall.sh (сервис etc в dinit)."
+    echo "# В fstab их быть не должно: на момент старта их ещё нет, и"
+    echo "# mount -a упал бы с «No such file or directory»."
+    echo
+    # /boot, если он на отдельном разделе.
+    BOOTDEV=$(awk '$2 == "/boot" {print $1; exit}' /proc/mounts || true)
+    if [ -n "$BOOTDEV" ]; then
+        BOOT_UUID=$(blkid -s UUID -o value "$BOOTDEV" 2>/dev/null || true)
+        if [ -n "$BOOT_UUID" ]; then
+            echo "UUID=$BOOT_UUID /boot ext4 defaults,noatime 0 2"
+        fi
+    fi
+} > /etc/fstab
+
+# --- grub.cfg --------------------------------------------------------------
+# console=tty0 ПЕРВЫМ: ядро открывает только первую указанную консоль,
+# и всё остальное (tty1..tty63, терминал на VGA) молчит. ttyS0 сюда не
+# пишем намеренно: на живой машине последовательной консоли нет, и её
+# отсутствие — не ошибка.
+#
+# nohz=off обязателен. С CONFIG_NO_HZ_IDLE ядро останавливает таймеры на
+# простое, и под QEMU это даёт зависание, которое выглядит как «ядро не
+# стартует», хотя оно стартует и работает.
+#
+# root= — устройство корня. Не UUID: init в initramfs ищет корень сам,
+# перебором /dev/vda1, /dev/vda и далее, и root= тут только снимает
+# сообщение ядра «VFS: Unable to mount root fs».
+mkdir -p /boot/grub
+cat > /boot/grub/grub.cfg <<EOF
+# grub.cfg — создан slattware-grub-install $(date '+%F %T')
+# Файл написан руками. grub-mkconfig не зовём: он собирает конфиг из
+# чужих скриптов в /etc/grub.d и требует grub-probe, который должен
+# видеть примонтированную систему. Здесь всё наоборот — три строки, и
+# мы знаем их значения.
+set timeout=5
+set default=0
+
+menuentry "slattware" {
+    linux  /vmlinuz console=tty0 root=$ROOTDEV rw nohz=off quiet
+    initrd /initrd.img
+}
+
+menuentry "slattware (отладка)" {
+    linux  /vmlinuz console=tty0 root=$ROOTDEV rw nohz=off loglevel=7
+    initrd /initrd.img
+}
+EOF
+
+# --- установка GRUB --------------------------------------------------------
+if [ "$EFI" = 1 ]; then
+    # --removable кладёт загрузчик в EFI-раздел, названный по имени
+    # диска. Без этого файл называется EFI/BOOTX64.EFI на разделе с
+    # меткой ESP, и если метка не та, прошивка загрузку не найдёт.
+    echo "==> EFI: ставлю GRUB в $DISK"
+    "$GRUB_INSTALL" --target=x86_64-efi --efi-directory=/boot \
+                     --bootloader-id=slattware --reusable "$DISK"
+    echo "==> копирую загрузчик в EFI/BOOT/BOOTX64.EFI (запасной путь)"
+    mkdir -p /boot/EFI/BOOT
+    cp -f /boot/EFI/slattware/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+else
+    echo "==> BIOS: ставлю GRUB в MBR $DISK"
+    "$GRUB_INSTALL" --target=i386-pc --reusable "$DISK"
+fi
+
+echo
+echo "Готово. Проверить можно так:"
+echo "  ls -l /boot/            — vmlinuz и initrd.img на месте"
+echo "  cat /etc/fstab          — UUID корня"
+echo "  cat /boot/grub/grub.cfg"
+echo
+echo "Осталось размонтировать и перезагрузиться:"
+echo "  exit                    — выйти из chroot"
+echo "  umount -R /mnt          — размонтировать всё"
+echo "  reboot"

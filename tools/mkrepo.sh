@@ -21,6 +21,18 @@ cd "$(dirname "$0")/.."
 REPO=$PWD/share/repo
 TCC="$PWD/rootfs/usr/bin/tcc -B $PWD/rootfs/usr/lib/tcc"
 
+# Корень проекта для build:.
+#
+# build: исполняется в КОПИИ исходника пакета во временном каталоге,
+# поэтому относительные пути внутри него указывают не туда. Единственный
+# способ добраться до дерева ядра и прочих файлов проекта — переменная
+# окружения с абсолютным путём.
+#
+# Именно так и делает пакет linux: его build: зовёт
+# tools/mklinux-pkg.sh, который берёт bzImage из kernel/<версия>/ и
+# собирает initramfs из initramfs/.
+SLAT_ROOT=$PWD
+
 
 mkdir -p "$REPO"
 
@@ -37,8 +49,18 @@ meta_get() {
 # подобные требуют libblkid, libsmartcols, libfdisk и т.п.).
 meta_install_lines() {
     [ -f "$1" ] || return 1
+    # Комментарии внутри блока install: пропускаем.
+    #
+    # Пустая строка блок не закрывает: в sed регулярка
+    # /^[^[:space:]#]/ требует символ, а на пустой строке его нет. Так
+    # блок продолжался до следующего ключа, и комментарии внутри него
+    # попадали в разбор как «откуда» — с ошибкой
+    #     install: нет каталога # в исходнике
+    # то есть любая попытка объяснить в bdd.meta, что делает install:,
+    # ломала сборку пакета. Читать приходилось молча, без комментариев.
     sed -n '/^install:[[:space:]]*$/,/^[^[:space:]#]/{
         s/^[[:space:]]*//
+        /^#/d
         /^[a-z_][a-z_0-9]*:/d
         p
     }' "$1"
@@ -191,7 +213,7 @@ build_one() {
     # сборка
     if [ -n "$build" ]; then
         printf '  сборка %s: %s\n' "$name" "$build"
-        ( cd "$src_copy" && TCC="$TCC" \
+        ( cd "$src_copy" && TCC="$TCC" SLAT_ROOT="$SLAT_ROOT" \
             sh -c "$build" ) || { rm -rf "$work"; printf 'сборка %s не удалась\n' "$name" >&2; return 1; }
         chmod -R u+rwX,go+rX "$src_copy"
         find "$src_copy" -type f -name '*' -exec sh -c '

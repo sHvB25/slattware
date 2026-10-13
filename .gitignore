@@ -46,6 +46,14 @@ bzImage
 /share/.hosttime
 /share/.hosttz
 
+# --- Ядро как пакет ---------------------------------------------------------
+# share/repo/src/linux/boot/ заполняется на время сборки пакета:
+# там vmlinuz на 20 МБ и initrd.img. В git им не место — каждое
+# обновление ядра раздувало бы историю на двадцать мегабайт, и
+# удалить их оттуда уже нельзя. Собираются заново:
+#     ./tools/build-kernel.sh && ./tools/mklinux-pkg.sh
+/share/repo/src/linux/boot/
+
 # --- Сборка Live CD: mkiso.sh собирает заново ------------------------------
 /build-iso/
 *.iso

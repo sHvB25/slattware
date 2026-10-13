@@ -1,0 +1,15 @@
+version: 7.2.8
+description: Linux — ядро и initramfs, собранные из своего исходника
+maintainer: aetherria
+depends: busybox musl
+essential: yes
+build: sh "$SLAT_ROOT/tools/mklinux-pkg.sh" --stage .
+
+# Ядро ставится в /boot, а не в /usr/local/bin: там его ищет
+# загрузчик, и больше нигде ему быть не надо.
+#
+# Каталог boot/ в исходнике пакета НЕ хранится в git — 20 МБ на
+# каждое обновление ядра раздувают историю репозитория. Файлы
+# появляются в нём только на время сборки, их кладёт build:.
+install:
+  boot  /boot

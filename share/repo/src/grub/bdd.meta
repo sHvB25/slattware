@@ -1,0 +1,23 @@
+version: 2.14
+description: GRUB — загрузчик операционной системы
+maintainer: aetherria
+depends: busybox musl util-linux
+
+# GRUB нужен внутри chroot, чтобы slattware-grub-install мог запустить
+# grub-install на целевую систему. Ставится в связке с linux:
+#
+#   bdd install linux grub
+#   slattware-grub-install /dev/sda
+#
+# install: модули лежат в /usr/lib/grub, и grub-install ищет их именно
+# там. Обычная раскладка пакета положила бы их в /usr/local/lib/grub/,
+# где их нет, и grub-install упал бы с «cannot find a GRUB drive for
+# ...».
+#
+# depends: util-linux — ради blkid, которым grub-install читает UUID и
+# метки разделов. libdevmapper.so.1.02 и liblzma.so.5 приходят
+# вместе с бинарями, отдельными пакетами они не нужны.
+#
+# Модулей 1216 на 12 МБ. Они не компилируются, берутся с хоста.
+install:
+  grubmod  /usr/lib/grub
