@@ -1,4 +1,4 @@
-version: 7.2.8
+version: 7.2.10
 description: Linux — ядро и initramfs, собранные из своего исходника
 maintainer: aetherria
 depends: busybox musl

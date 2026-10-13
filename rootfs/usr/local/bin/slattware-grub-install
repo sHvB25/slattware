@@ -68,6 +68,22 @@ done
 # Корень chroot. Все пути дальше — относительно него, иначе grub.cfg
 # и fstab получат пути хостовой системы, и система после установки
 # будет грузиться с чужой файловой системой.
+# --- поиск разделов --------------------------------------------------------
+# Устройство, смонтированное в $DESTROOT/<путь>.
+#
+# НЕЛЬЗЯ просто читать /proc/mounts и искать «$2 == /home»: при запуске
+# с --root скрипт работает СНАРУЖИ целевой системы, и в /proc/mounts
+# хоста лежат разделы ХОСТА, а не цели. Там может не оказаться ничего
+# похожего, и /home в fstab просто не попадёт.
+#
+# Путь цели получается приписыванием $DESTROOT к относительному пути.
+# Если $DESTROOT = /, поведение прежнее — ищем /home как есть.
+dev_for() {
+    _rel=$1
+    if [ "$_rel" = / ]; then _abs=$DESTROOT; else _abs=$DESTROOT$_rel; fi
+    awk -v p="$_abs" '$2 == p {print $1; exit}' /proc/mounts 2>/dev/null || :
+}
+
 # --- что ставим и на чём корень -------------------------------------------
 # Аргумент трактуется как «устройство с корнем»: из него получается и
 # раздел для root= в grub.cfg, и диск для MBR.
@@ -198,7 +214,7 @@ fi
     echo "# mount -a упал бы с «No such file or directory»."
     echo
     # /boot, если он на отдельном разделе.
-    BOOTDEV=$(awk '$2 == "/boot" {print $1; exit}' /proc/mounts || true)
+    BOOTDEV=$(dev_for /boot)
     if [ -n "$BOOTDEV" ]; then
         BOOT_UUID=$(blkid -s UUID -o value "$BOOTDEV" 2>/dev/null || true)
         if [ -n "$BOOT_UUID" ]; then
@@ -210,7 +226,7 @@ fi
     # То же, что /boot, но про него забывали чаще: в fstab /home не
     # попадал, mountall его не монтировал, и login писал
     #     can't change directory to '/home/slat'
-    HOMEDEV=$(awk '$2 == "/home" {print $1; exit}' /proc/mounts || true)
+    HOMEDEV=$(dev_for /home)
     if [ -n "$HOMEDEV" ]; then
         HOME_UUID=$(blkid -s UUID -o value "$HOMEDEV" 2>/dev/null || true)
         if [ -n "$HOME_UUID" ]; then
@@ -345,7 +361,7 @@ if [ "$EFI" = 1 ]; then
     # Проверяем тип ФС и говорим, что делать, вместо тихой порчи.
     _bootsrc=
     if [ -r /proc/mounts ]; then
-        _bootsrc=$(awk '$2 == "/boot" {print $1; exit}' /proc/mounts) || :
+        _bootsrc=$(dev_for /boot)
         [ -n "$_bootsrc" ] || _bootsrc=$ROOTDEV
     else
         _bootsrc=$ROOTDEV

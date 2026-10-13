@@ -42,10 +42,22 @@ die() { printf '!!! %s\n' "$*" >&2; exit 1; }
 # и следующий запуск делает вид, что окружение уже готово, хотя
 # оно осталось от прошлого прогона с другим состоянием репозитория.
 cleanup() {
+    # Порядок размонтирования важен: /home лежит ВНУТРИ $MNT, и обычный
+    # `umount $MNT` отказывается (busy), если вложенное не снято.
+    #
+    # На этом тест и ломался, причём молча: уборка оставляла $MNT
+    # смонтированным, следующий запуск доходил до `rm -rf $MNT` и
+    # умирал на EBUSY без единого слова — выглядело как «тест завис».
+    # Последние два запуска подряд так и выглядели.
+    #
+    # umount -R снимает всё рекурсивно, -l отвязывает даже если
+    # кто-то держит файл открытым. Порядок: -R сначала, -l если не
+    # вышло.
     as_root "rm -f $LIVE_BIN/slattware-pacstrap $LIVE_BIN/slattware-chroot \
              $LIVE_BIN/slattware-grub-install; \
              [ -L $LIVE_BIN/bdd ] && rm -f $LIVE_BIN/bdd; \
-             umount $MNT 2>/dev/null; losetup -D 2>/dev/null" || :
+             umount -R $MNT 2>/dev/null || umount -R -l $MNT 2>/dev/null; \
+             losetup -D 2>/dev/null" || :
 }
 trap cleanup EXIT INT TERM
 
@@ -87,18 +99,18 @@ do_install() {
     as_root "mkfs.ext4 -q -F -L slattware-home ${LOOP}p2"
 
     say "монтирую корень в $MNT"
-    rm -rf "$MNT"; mkdir -p "$MNT"
-    as_root "mount ${LOOP}p1 $MNT"
+    # Каталог мог остаться смонтированным с прошлого прогона. rm -rf по
+    # смонтированному каталогу падает с EBUSY, и без проверки скрипт
+    # умирает молча. Проверяем ЗАРАНЕЕ и говорим, что не так.
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        as_root "umount -R $MNT" || as_root "umount -R -l $MNT" \
+            || die "не могу размонтировать $MNT — прогони doas umount -R $MNT вручную"
+    fi
+    rm -rf "$MNT" || die "не удалось очистить $MNT"
+    mkdir -p "$MNT"
+    as_root "mount ${LOOP}p1 $MNT" || die "не смонтировал ${LOOP}p1"
 
-    # /home монтируем ДО установки, а не после. Так slattware-grub-install
-    # видит его в /proc/mounts и пишет строку в fstab. Если не
-    # смонтировать, ветка «раздел /home есть» не проверяется вовсе, и
-    # ошибка всплывёт только у человека на ноутбуке — с «login: can't
-    # change directory to '/home/slat'».
-    say "монтирую /home"
-    as_root "mkdir -p $MNT/home && mount ${LOOP}p2 $MNT/home"
-
-    say "разворачиваю живое окружение"
+say "разворачиваю живое окружение"
     # pacstrap ищет инструменты по АБСОЛЮТНОМУ пути /usr/local/bin/,
     # потому что на Live CD они там и лежат. На хосте исходники лежат в
     # rootfs/usr/local/bin/, и pacstrap их не видел — а копировал бы
@@ -137,6 +149,17 @@ do_install() {
              sh $LIVE_BIN/slattware-pacstrap \
              -b 'busybox musl dinit bdd sud myfetch util-linux e2fsprogs' \
              $MNT"
+
+    say "монтирую /home: ${LOOP}p2 → $MNT/home"
+    # ПОСЛЕ pacstrap, не до. Порядок вынужденный: pacstrap требует
+    # пустой корень и отказывает на «внутри: home». Так делает и Arch —
+    # /home монтируют уже после pacstrap.
+    #
+    # Нужно, чтобы slattware-grub-install увидел раздел и написал строку
+    # в fstab. Он запускается с --root снаружи и смотрит /proc/mounts
+    # ХОСТА, поэтому ищет путь $MNT/home, а не /home.
+    as_root "mkdir -p $MNT/home && mount ${LOOP}p2 $MNT/home" \
+        || die "не смонтировал ${LOOP}p2 в /home"
 
     say "/etc системы: rootfs/etc (как на Live CD)"
     # pacstrap копирует /etc ЖИВОЙ системы. На настоящем Live CD живая
@@ -184,7 +207,10 @@ do_install() {
              $LIVE_BIN/slattware-grub-install --root $MNT ${LOOP}p1"
 
     say "размонтирую"
-    as_root "umount $MNT" || as_root "umount -l $MNT"
+    # Именно -R: внутри $MNT смонтирован /home, и обычный umount $MNT
+    # отказывается с «target is busy», оставляя образ в смонтированном
+    # состоянии — и следующий запуск падает на rm -rf с EBUSY.
+    as_root "umount -R $MNT" || as_root "umount -R -l $MNT" || :
     as_root "losetup -d $LOOP" || :
     say "поставлено: $IMG"
 }
