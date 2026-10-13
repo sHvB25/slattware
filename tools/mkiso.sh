@@ -217,10 +217,25 @@ ok "/init, точки монтирования и /home/slat на месте"
 
 # Скрипты установки — то, ради чего всё затевалось.
 mkdir -p "$bddroot/usr/local/bin"
-cp "$ROOT/rootfs/usr/local/bin/slattware-pacstrap" "$bddroot/usr/local/bin/"
-cp "$ROOT/rootfs/usr/local/bin/slattware-chroot"    "$bddroot/usr/local/bin/"
-chmod 755 "$bddroot/usr/local/bin/"slattware-*
-ok "pacstrap и chroot в образе"
+# Инструменты конструктора — ВСЕ, что лежат в rootfs/usr/local/bin.
+#
+# Перечислять по именам нельзя: список разошёлся с реальностью, и на
+# Live CD не оказалось slattware-grub-install. Человек ставил систему,
+# доходил до шага «поставить загрузчик» и обнаруживал, что команды нет.
+# Проверялось загрузкой ISO: `command -v slattware-grub-install` пусто.
+#
+# Копируем по маске, и проверка после — что ни один не потерялся.
+for _t in "$ROOT"/rootfs/usr/local/bin/slattware-*; do
+    [ -f "$_t" ] || continue
+    cp "$_t" "$bddroot/usr/local/bin/"
+done
+chmod 755 "$bddroot/usr/local/bin/"slattware-* 2>/dev/null || :
+
+# Проверка: сколько инструментов ожидаем, столько и попало.
+_want=$(ls "$ROOT"/rootfs/usr/local/bin/slattware-* 2>/dev/null | wc -l | tr -d ' ')
+_got=$(ls "$bddroot"/usr/local/bin/slattware-* 2>/dev/null | wc -l | tr -d ' ')
+[ "$_want" = "$_got" ] || die "в образ попало $_got инструментов из $_want — Live CD неполон"
+ok "инструменты конструктора в образе: $_got"
 
 # Репозиторий — целиком. Чтобы на Live CD можно было ставить пакеты
 # без сети и без 9p-шары: mount/cp в busybox это умеет.
