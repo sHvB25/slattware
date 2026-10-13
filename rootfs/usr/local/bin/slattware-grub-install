@@ -205,7 +205,49 @@ fi
             echo "UUID=$BOOT_UUID /boot ext4 defaults,noatime 0 2"
         fi
     fi
+    # /home, если он на отдельном разделе.
+    #
+    # То же, что /boot, но про него забывали чаще: в fstab /home не
+    # попадал, mountall его не монтировал, и login писал
+    #     can't change directory to '/home/slat'
+    HOMEDEV=$(awk '$2 == "/home" {print $1; exit}' /proc/mounts || true)
+    if [ -n "$HOMEDEV" ]; then
+        HOME_UUID=$(blkid -s UUID -o value "$HOMEDEV" 2>/dev/null || true)
+        if [ -n "$HOME_UUID" ]; then
+            echo "UUID=$HOME_UUID /home ext4 defaults,noatime 0 2"
+        fi
+    fi
 } > "$DESTROOT/etc/fstab"
+
+# --- домашний каталог ------------------------------------------------------
+# Каталог пользователя должен существовать ВСЕГДА, независимо от того,
+# смонтирован /home или нет.
+#
+# Без этого login отказывает:
+#     login: can't change directory to '/home/slat'
+# и человек не попадает в сессию, хотя система загрузилась. Случай
+# не редкий: раздел /home есть, но в fstab не попал (см. выше), или
+# раздела /home нет вовсе — а каталог всё равно нужен, положить
+# туда что-то и иметь рабочее окружение.
+#
+# Права 0755, владелец uid пользователя из /etc/passwd: skel копируется
+# от его имени, иначе файлы в домашнем каталоге будут чужими.
+_sl_uid=$(awk -F: '$1 == "slat" {print $3; exit}' "$DESTROOT/etc/passwd" 2>/dev/null) || :
+if [ -z "$_sl_uid" ]; then _sl_uid=1000; fi
+mkdir -p "$DESTROOT/home/slat"
+if [ -d "$DESTROOT/etc/skel" ]; then
+    cp -a "$DESTROOT/etc/skel/." "$DESTROOT/home/slat/" 2>/dev/null || :
+fi
+chown -R "$_sl_uid" "$DESTROOT/home/slat" 2>/dev/null \
+    || warn "не смог отдать /home/slat пользователю uid=$_sl_uid"
+ok "/home/slat создан (uid $_sl_uid)"
+
+if [ -z "$HOMEDEV" ]; then
+    warn "раздел /home не смонтирован — в fstab строки нет.
+  Если он есть, смонтируй его и перезапусти slattware-grub-install,
+  либо допиши строку руками:
+      UUID=\$(blkid -s UUID -o value /dev/sdXN) /home ext4 defaults,noatime 0 2"
+fi
 
 # --- grub.cfg --------------------------------------------------------------
 # console=tty0 ПЕРВЫМ: ядро открывает только первую указанную консоль,
@@ -291,6 +333,42 @@ ok "grub.cfg: root=$_GDEV (таблица $_PTTYPE, раздел $_PART)"
 
 # --- установка GRUB --------------------------------------------------------
 if [ "$EFI" = 1 ]; then
+    # EFI-раздел ОБЯЗАН быть FAT32.
+    #
+    # --efi-directory указывает на раздел с системным разделом EFI
+    # (ESP), и прошивка читает загрузчик именно оттуда. Наш /boot —
+    # обычный ext4, и grub-install на него либо откажется, либо напишет
+    # файл, который прошивка никогда не прочитает: система не найдёт
+    # загрузчика и упадёт в «no bootable device» при вполне рабочей
+    # установке.
+    #
+    # Проверяем тип ФС и говорим, что делать, вместо тихой порчи.
+    _bootsrc=
+    if [ -r /proc/mounts ]; then
+        _bootsrc=$(awk '$2 == "/boot" {print $1; exit}' /proc/mounts) || :
+        [ -n "$_bootsrc" ] || _bootsrc=$ROOTDEV
+    else
+        _bootsrc=$ROOTDEV
+    fi
+    _bootfs=$(blkid -s TYPE -o value "$_bootsrc" 2>/dev/null) || _bootfs=
+    case "$_bootfs" in
+        vfat|fat|fat32|fat16) : ;;
+        *)
+            die "режим EFI требует, чтобы /boot был на разделе FAT32.
+  Сейчас там: ${_bootfs:-неизвестная ФС} ($_bootsrc), а EFI-загрузчик
+  прошивка читает только с ESP.
+
+  Что сделать:
+    1. создать раздел FAT32 (~512 МБ, метка ESP) и смонтировать его
+       в /boot, затем запустить скрипт снова;
+    2. либо монтировать ESP в /boot/efi и указать его:
+         slattware-grub-install --efi-dir /boot/efi /dev/sdXN
+    3. либо поставить BIOS-загрузчик в MBR:
+         SLAT_EFI=0 slattware-grub-install /dev/sdXN"
+            ;;
+    esac
+    ok "ESP: $_bootsrc ($_bootfs)"
+
     echo "==> EFI: ставлю GRUB в $DISK"
     # --no-nvram: запись переменных загрузчика требует efivarfs и
     # работает не везде. Без неё загрузчик кладётся обычным файлом и

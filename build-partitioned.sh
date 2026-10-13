@@ -94,7 +94,15 @@ fi
 as_root chmod 1777 "$MNT/tmp" "$MNT/var/tmp" 2>/dev/null || :
 
 say "кладу ядро и initramfs в /boot раздела"
-as_root cp kernel/7.2.8/arch/x86/boot/bzImage "$MNT/boot/vmlinuz"
+# Версию ядра берём из config/KERNEL_VERSION, а НЕ пишем вручную.
+# Здесь было зашито kernel/7.2.8/: после обновления до 7.2.10 скрипт
+# молча скопировал бы в /boot старое ядро, а unac -r показал бы 7.2.8.
+# Версию видно только в config/KERNEL_VERSION, и читать надо её.
+KVER=$(cat config/KERNEL_VERSION 2>/dev/null) \
+    || die "нет config/KERNEL_VERSION"
+[ -f "kernel/$KVER/arch/x86/boot/bzImage" ] \
+    || die "нет собранного ядра kernel/$KVER — сначала ./tools/build-kernel.sh"
+as_root cp "kernel/$KVER/arch/x86/boot/bzImage" "$MNT/boot/vmlinuz"
 as_root cp "$INITRD" "$MNT/boot/initrd.img"
 as_root chown 0:0 "$MNT/boot/vmlinuz" "$MNT/boot/initrd.img"
 

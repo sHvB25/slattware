@@ -90,6 +90,14 @@ do_install() {
     rm -rf "$MNT"; mkdir -p "$MNT"
     as_root "mount ${LOOP}p1 $MNT"
 
+    # /home монтируем ДО установки, а не после. Так slattware-grub-install
+    # видит его в /proc/mounts и пишет строку в fstab. Если не
+    # смонтировать, ветка «раздел /home есть» не проверяется вовсе, и
+    # ошибка всплывёт только у человека на ноутбуке — с «login: can't
+    # change directory to '/home/slat'».
+    say "монтирую /home"
+    as_root "mkdir -p $MNT/home && mount ${LOOP}p2 $MNT/home"
+
     say "разворачиваю живое окружение"
     # pacstrap ищет инструменты по АБСОЛЮТНОМУ пути /usr/local/bin/,
     # потому что на Live CD они там и лежат. На хосте исходники лежат в
