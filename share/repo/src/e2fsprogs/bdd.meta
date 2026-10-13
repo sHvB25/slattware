@@ -1,0 +1,27 @@
+version: 1.0
+description: e2fsprogs — создание и проверка ФС ext2/3/4
+maintainer: aetherria
+depends: util-linux
+# mkfs.ext4 — второй инструмент, без которого систему не поставить.
+# e2fsck и fsck.ext4 — проверка и починка ФС после развала.
+# mkswap — раздел подкачки.
+#
+# depends: util-linux не для приличия. Замыкание библиотек, посчитанное
+# tools/mkpkg-host.sh, показывает: libext2fs.so.2 тянет libuuid.so.1,
+# libblkid.so.1 и libeconf.so.0 — все три лежат в util-linux. Без него
+# пакет ставится без ошибки, а mkfs.ext4 падает с «Error loading shared
+# library libuuid.so.1».
+#
+# Бинари musl-native, ничего не компилируется.
+#
+# ЧЕГО НЕТ. tune2fs, resize2fs, dumpe2fs, debugfs, badblocks, filefrag,
+# e2image и e2freefrag на Alpine лежат в отдельном пакете
+# e2fsprogs-extra, которого на хосте нет. Для установки системы они не
+# нужны; resize2fs пригодится, когда будешь менять размер корневого
+# раздела. Добавить, когда пакет появится.
+#
+# install: библиотекам нужен именно /usr/lib — он есть в пути поиска
+# musl (/lib:/usr/local/lib:/usr/lib). Обычная раскладка пакета кладёт
+# их в /usr/local/lib/<имя>/, где загрузчик их не ищет.
+install:
+  lib  /usr/lib

@@ -64,7 +64,12 @@ REPO="$ROOT/share/repo"
 # Пакеты live-окружения.
 #
 # Первая группа — то, без чего ручная установка невозможна.
-LIVE_BASE="busybox musl dinit bdd sud myfetch"
+# Базовые пакеты Live CD.
+#
+# util-linux и e2fsprogs обязательны: без них с Live CD нельзя
+# разметить диск и создать ФС, то есть Live CD не годится для
+# установки. Это не «полезно иметь», а условие работоспособности.
+LIVE_BASE="busybox musl dinit bdd sud myfetch util-linux e2fsprogs"
 # Вторая — утилиты разметки и ФС. Их в системе нет, они нужны только
 # пока ты на Live CD.
 LIVE_TOOLS="util-linux e2fsprogs"
